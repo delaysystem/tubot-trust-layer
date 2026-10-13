@@ -1,0 +1,26 @@
+{
+  "name": "tubot-trust-layer",
+  "version": "0.0.0",
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "bun-types": "^1.4.2",
+    "typescript": "^5.5.2",
+    "wrangler": "^4.137.0"
+  },
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "cf-typegen": "wrangler types",
+    "test": "bun run build:wasm && bun test --preload ./scripts/test-wasm.ts",
+    "test:e2e": "bash scripts/e2e-staging.sh",
+    "typecheck": "bunx tsc --noEmit",
+    "build:wasm": "bun scripts/build-wasm.ts",
+    "test:rust": "bun scripts/test-rust.ts",
+    "test:smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@openredaction/core": "1.1.5"
+  }
+}
