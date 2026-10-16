@@ -1,9 +1,24 @@
 /**
- * Meta Llama Guard 3 Safety Moderation Engine & Fast Heuristics Scanner.
+ * Safety Moderation Engine: Fast Heuristics + Clef-flash decisions + Llama Guard fallback.
  * Provides multi-tier moderation:
  * - Tier 1: Sub-millisecond deterministic regex/pattern heuristics (prompt injections, zero-width evasion, XSS, SQLi).
- * - Tier 2: Meta Llama Guard 3 8B classification via Cloudflare Workers AI (@cf/meta/llama-guard-3-8b).
+ * - Tier 2: Clef-flash 9B decision model via Cloudflare Workers AI (@cf/cloudflare/clef-flash),
+ *   one forward pass over 14 yes/no safety questions (no text generation).
+ * - Tier 2 fallback: Meta Llama Guard 3 8B (@cf/meta/llama-guard-3-8b) when clef-flash
+ *   is unavailable or returns a malformed answer set.
+ * - Tier 2 cross-provider fallback: Google Gemini (gemini-3.5-flash) when every
+ *   Workers AI engine fails and a server Gemini key is configured.
  */
+
+import {
+  clefDecide,
+  CLEF_FLASH_MODEL_ID,
+  CLEF_MODERATE_THRESHOLD,
+  type ClefNoulQuestion,
+} from "./clef";
+import { GEMINI_MODEL_ID, geminiSafetyScan } from "./gemini";
+
+export const LLAMA_GUARD_MODEL_ID = "@cf/meta/llama-guard-3-8b";
 
 export type SafetySeverity = "critical" | "high" | "medium";
 
@@ -114,14 +129,51 @@ export interface LlamaGuardResult {
   error?: string;
 }
 
+export interface ClefGuardFinding {
+  source: "clef-flash";
+  code?: string;
+  category: string;
+  detail?: string;
+  severity?: SafetySeverity;
+}
+
+export interface ClefGuardResult {
+  safe: boolean;
+  categoryCodes: string[];
+  categories: string[];
+  findings: ClefGuardFinding[];
+  rawResponse?: any;
+}
+
 export interface ModerateOptions {
   mode?: "block" | "warn";
   heuristicOnly?: boolean;
   allowedCategories?: string[];
+  /** Use clef-flash as the Tier 2 engine (default true). Set false to force legacy Llama Guard. */
+  useClef?: boolean;
+  /**
+   * When every Tier 2 engine fails, return the Tier-1 heuristic verdict with
+   * degraded:true instead of throwing 503 (default false = fail closed).
+   */
+  allowDegraded?: boolean;
+  /**
+   * Server Gemini API key. When set, a failing Workers AI Tier 2 falls over
+   * to Gemini before degrading or throwing. Supplied by the worker from env;
+   * RPC/HTTP callers must not set it (the server overrides it).
+   */
+  geminiKey?: string;
+}
+
+export interface GeminiGuardFinding {
+  source: "gemini";
+  code?: string;
+  category: string;
+  detail?: string;
+  severity?: SafetySeverity;
 }
 
 export interface ModerateFinding {
-  source: "heuristic" | "llama-guard";
+  source: "heuristic" | "llama-guard" | "clef-flash" | "gemini";
   code?: string;
   category: string;
   detail?: string;
@@ -136,6 +188,12 @@ export interface ModerateResult {
   categoryCodes: string[];
   findings: ModerateFinding[];
   executionTimeMs: number;
+  /** Inference models called, in order. Empty when no inference ran. */
+  models: string[];
+  /** True when served from the D1 result cache without any inference. */
+  cached?: boolean;
+  /** True when Tier 2 was unavailable and the verdict rests on Tier-1 heuristics alone. */
+  degraded?: boolean;
 }
 
 // ---------------------------------------------------------
@@ -418,7 +476,7 @@ export async function llamaGuardScan(
 
   try {
     const rawResult: any = await (ai as any).run(
-      "@cf/meta/llama-guard-3-8b",
+      LLAMA_GUARD_MODEL_ID,
       {
         messages: [{ role: "user", content: text }],
       }
@@ -476,8 +534,135 @@ export async function llamaGuardScan(
 }
 
 /**
+ * Gemini cross-provider safety scanner. Same S1..S14 verdict contract as
+ * llamaGuardScan; throws 503-shaped when Gemini is unreachable so the
+ * caller falls through to degraded mode or fail-closed.
+ */
+export async function geminiGuardScan(
+  text: string,
+  apiKey: string
+): Promise<{ safe: boolean; categoryCodes: string[]; categories: string[]; findings: GeminiGuardFinding[] }> {
+  if (!text || typeof text !== "string" || text.trim().length === 0) {
+    return { safe: true, categoryCodes: [], categories: [], findings: [] };
+  }
+  const verdict = await geminiSafetyScan(text, apiKey);
+  const findings: GeminiGuardFinding[] = [];
+  const categories: string[] = [];
+  for (const code of verdict.categoryCodes) {
+    const catInfo = LLAMA_GUARD_CATEGORIES[code];
+    if (catInfo) {
+      categories.push(catInfo.name);
+      findings.push({
+        source: "gemini",
+        code,
+        category: catInfo.name,
+        detail: catInfo.description,
+        severity: catInfo.severity,
+      });
+    } else {
+      categories.push(code);
+      findings.push({
+        source: "gemini",
+        code,
+        category: code,
+        detail: `Gemini safety violation (${code})`,
+        severity: "high",
+      });
+    }
+  }
+  if (!verdict.safe && findings.length === 0) {
+    categories.push("Unspecified Safety Violation");
+    findings.push({
+      source: "gemini",
+      category: "Unspecified Safety Violation",
+      detail: "Content flagged as unsafe by Gemini",
+      severity: "high",
+    });
+  }
+  return { safe: verdict.safe, categoryCodes: verdict.categoryCodes, categories: Array.from(new Set(categories)), findings };
+}
+
+/**
+ * Builds one yes/no safety question per S1..S14 category. The existing
+ * category descriptions define what a "yes" means; benign content that
+ * merely mentions a topic without violating the policy is a "no".
+ */
+export function buildClefSafetyQuestions(): Record<string, ClefNoulQuestion> {
+  const questions: Record<string, ClefNoulQuestion> = {};
+  for (const [code, info] of Object.entries(LLAMA_GUARD_CATEGORIES)) {
+    questions[code] = {
+      type: "noul",
+      instructions: `Does this content violate the ${info.name} safety policy?`,
+      criteria: {
+        true: info.description,
+        false:
+          "Benign content that does not match this category. Merely mentioning " +
+          "a sensitive topic without encouraging, facilitating, or depicting " +
+          "it is not a violation.",
+      },
+    };
+  }
+  return questions;
+}
+
+/**
+ * Clef-flash AI Scanner (Tier 2 primary).
+ * Invokes @cf/cloudflare/clef-flash via Cloudflare Workers AI: a single
+ * forward pass over 14 yes/no safety questions, no text generation.
+ * Returns null when clef-flash is unavailable or its answer set is
+ * incomplete/malformed, so the caller falls back to Llama Guard.
+ */
+export async function clefGuardScan(
+  text: string,
+  ai: Ai
+): Promise<ClefGuardResult | null> {
+  if (!text || typeof text !== "string" || text.trim().length === 0) {
+    return {
+      safe: true,
+      categoryCodes: [],
+      categories: [],
+      findings: [],
+    };
+  }
+
+  const questions = buildClefSafetyQuestions();
+  const decided = await clefDecide(ai as any, text, questions);
+  if (!decided) {
+    return null;
+  }
+
+  const findings: ClefGuardFinding[] = [];
+  const categories: string[] = [];
+  const categoryCodes: string[] = [];
+
+  for (const [code, info] of Object.entries(LLAMA_GUARD_CATEGORIES)) {
+    const probability = decided.probabilities[code] ?? 0;
+    if (probability >= CLEF_MODERATE_THRESHOLD) {
+      categoryCodes.push(code);
+      categories.push(info.name);
+      findings.push({
+        source: "clef-flash",
+        code,
+        category: info.name,
+        detail: `${info.description} (clef-flash p=${probability.toFixed(2)})`,
+        severity: info.severity,
+      });
+    }
+  }
+
+  return {
+    safe: findings.length === 0,
+    categoryCodes,
+    categories: Array.from(new Set(categories)),
+    findings,
+    rawResponse: decided.rawResponse,
+  };
+}
+
+/**
  * Multi-Tier Moderation Entrypoint.
- * Evaluates Tier 1 deterministic heuristics + Tier 2 Meta Llama Guard 3.
+ * Evaluates Tier 1 deterministic heuristics + Tier 2 clef-flash decisions,
+ * with legacy Llama Guard 3 as the Tier 2 fallback.
  */
 export async function moderateInput(
   text: string,
@@ -499,21 +684,58 @@ export async function moderateInput(
         0,
         Math.round((performance.now() - startTime) * 100) / 100
       ),
+      models: [],
     };
   }
 
   // Tier 1: Fast Heuristic Scanner (< 1ms)
   const heuristicFindings = heuristicExploitScan(text);
 
-  // Tier 2: Llama Guard 3 Scanner (if AI binding provided and not heuristicOnly)
-  let lgFindings: ModerateFinding[] = [];
+  // Tier 2: Clef-flash decisions (if AI binding provided and not heuristicOnly),
+  // with legacy Llama Guard 3 as the automatic fallback. A clef verdict of
+  // "safe" (valid, empty findings) must NOT trigger the fallback: only fall
+  // back when clef produced no verdict at all (null). When both Workers AI
+  // engines fail and a Gemini key is configured, Gemini answers before the
+  // verdict degrades (allowDegraded) or throws 503.
+  const models: string[] = [];
+  let tier2Findings: ModerateFinding[] = [];
+  let degraded = false;
   if (ai && !options?.heuristicOnly) {
-    const lgResult = await llamaGuardScan(text, ai);
-    if (lgResult.error) throw Object.assign(new Error("Safety inference unavailable"), { status: 503 });
-    lgFindings = lgResult.findings;
+    let clefVerdict: ClefGuardResult | null = null;
+    if (options?.useClef !== false) {
+      models.push(CLEF_FLASH_MODEL_ID);
+      clefVerdict = await clefGuardScan(text, ai);
+    }
+    if (clefVerdict) {
+      tier2Findings = clefVerdict.findings;
+    } else {
+      models.push(LLAMA_GUARD_MODEL_ID);
+      let guardVerdict: { findings: ModerateFinding[] } | null = null;
+      try {
+        const lgResult = await llamaGuardScan(text, ai);
+        if (!lgResult.error) guardVerdict = lgResult;
+      } catch {
+        // Workers AI down: the cross-provider leg runs before giving up.
+      }
+      if (!guardVerdict && options?.geminiKey) {
+        models.push(GEMINI_MODEL_ID);
+        try {
+          guardVerdict = await geminiGuardScan(text, options.geminiKey);
+        } catch {
+          // Every Tier-2 engine failed; degrade or throw below.
+        }
+      }
+      if (guardVerdict) {
+        tier2Findings = guardVerdict.findings;
+      } else if (options?.allowDegraded !== true) {
+        throw Object.assign(new Error("Safety inference unavailable"), { status: 503 });
+      } else {
+        degraded = true;
+      }
+    }
   }
 
-  const allFindings: ModerateFinding[] = [...heuristicFindings, ...lgFindings];
+  const allFindings: ModerateFinding[] = [...heuristicFindings, ...tier2Findings];
 
   // Filter allowed categories if specified
   const allowed =
@@ -559,5 +781,7 @@ export async function moderateInput(
     categoryCodes,
     findings: activeFindings,
     executionTimeMs,
+    models,
+    ...(degraded ? { degraded: true as const } : {}),
   };
 }

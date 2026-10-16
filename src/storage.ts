@@ -2,6 +2,8 @@
  * D1 Storage operations for tubot-trust-layer.
  */
 
+import { CACHE_SCHEMA_STATEMENTS } from "./cache";
+
 export interface VaultRecord {
   vaultId: string;
   salt?: string | null;
@@ -47,6 +49,7 @@ export const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_pii_tokens_vault ON pii_tokens(vault_id)`,
   `CREATE INDEX IF NOT EXISTS idx_pii_tokens_token_id ON pii_tokens(token_id)`,
   `CREATE INDEX IF NOT EXISTS idx_pii_vault_expires ON pii_vault(expires_at)`,
+  ...CACHE_SCHEMA_STATEMENTS,
 ];
 
 export const SCHEMA_SQL = SCHEMA_STATEMENTS.join(";\n") + ";";

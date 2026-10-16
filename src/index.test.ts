@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { httpHandler as worker,
   executeMasking,
@@ -139,7 +139,43 @@ describe("Trust Layer Worker End-to-End API", () => {
     const data: any = await res.json();
     expect(data.status).toBe("healthy");
     expect(data.service).toBe("tubot-trust-layer");
-    expect(data.model).toBe("@cf/meta/llama-3.1-8b-instruct-fp8");
+    expect(data.model).toBe("@cf/cloudflare/clef-flash");
+  });
+
+  test("GET /health reports degraded when AI is bound but failing", async () => {
+    const downEnv = {
+      ...env,
+      AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
+    };
+    const req = new Request("https://trust.internal/health");
+    const res = await authenticatedFetch(req, downEnv, {} as any);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.status).toBe("degraded");
+    expect(data.ai).toBe("unavailable");
+    expect(data.hasAI).toBe(true);
+  });
+
+  test("GET /health stays healthy without an AI binding (heuristic-only config)", async () => {
+    const noAiEnv = { ...env, AI: undefined as any };
+    const req = new Request("https://trust.internal/health");
+    const res = await authenticatedFetch(req, noAiEnv, {} as any);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.status).toBe("healthy");
+    expect(data.ai).toBe("unbound");
+  });
+
+  test("GET /health reports Gemini fallback configuration", async () => {
+    const withKey = { ...env, GOOGLE_API_KEY: "k" };
+    const res = await authenticatedFetch(new Request("https://trust.internal/health"), withKey, {} as any);
+    const data: any = await res.json();
+    expect(data.hasGemini).toBe(true);
+    expect(data.degradedFallback).toBe("local-layers");
+    const withoutKey = { ...env, GOOGLE_API_KEY: undefined };
+    const res2 = await authenticatedFetch(new Request("https://trust.internal/health"), withoutKey, {} as any);
+    const data2: any = await res2.json();
+    expect(data2.hasGemini).toBe(false);
   });
 
   test("GET /tool-definitions returns valid OpenAI/Anthropic/Agentforce schemas", async () => {
@@ -256,13 +292,15 @@ describe("Trust Layer Worker End-to-End API", () => {
   });
 
   describe("Input Moderation & Exploit Shield Integration", () => {
-    test("GET /health reports both Granite and Llama Guard models", async () => {
+    test("GET /health reports clef-flash primary models with Llama fallbacks", async () => {
       const req = new Request("https://trust.internal/health");
       const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(200);
       const data: any = await res.json();
-      expect(data.models?.pii).toBe("@cf/meta/llama-3.1-8b-instruct-fp8");
-      expect(data.models?.moderation).toBe("@cf/meta/llama-guard-3-8b");
+      expect(data.models?.pii).toBe("@cf/cloudflare/clef-flash");
+      expect(data.models?.moderation).toBe("@cf/cloudflare/clef-flash");
+      expect(data.fallbackModels?.pii).toBe("@cf/meta/llama-3.1-8b-instruct-fp8");
+      expect(data.fallbackModels?.moderation).toBe("@cf/meta/llama-guard-3-8b");
     });
 
     test("GET /tool-definitions includes moderate_content schema", async () => {
@@ -388,6 +426,247 @@ describe("Trust Layer Worker End-to-End API", () => {
       const res = await entrypoint.moderate("What is the capital of France?");
       expect(res.safe).toBe(true);
       expect(res.action).toBe("allow");
+    });
+
+    test("POST /moderate reports which Tier 2 models ran", async () => {
+      const req = new Request("https://trust.internal/moderate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "What is the capital of France?" }),
+      });
+      const res = await authenticatedFetch(req, env, {} as any);
+      expect(res.status).toBe(200);
+      const data: any = await res.json();
+      // Mock AI answers clef-flash with legacy NER JSON (malformed for clef),
+      // so the request transparently falls back to Llama Guard.
+      expect(data.models).toEqual([
+        "@cf/cloudflare/clef-flash",
+        "@cf/meta/llama-guard-3-8b",
+      ]);
+    });
+
+    test("POST /detect reports which models ran and accepts clefThreshold", async () => {
+      const req = new Request("https://trust.internal/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "hello Alice", clefThreshold: 0.2 }),
+      });
+      const res = await authenticatedFetch(req, env, {} as any);
+      expect(res.status).toBe(200);
+      const data: any = await res.json();
+      expect(data.models).toEqual([
+        "@cf/cloudflare/clef-flash",
+        "@cf/meta/llama-3.1-8b-instruct-fp8",
+      ]);
+    });
+
+    test("POST /detect with allowDegraded answers degraded instead of 503", async () => {
+      const downEnv = {
+        ...env,
+        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
+      };
+      const req = new Request("https://trust.internal/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "email jane@example.com", allowDegraded: true }),
+      });
+      const res = await authenticatedFetch(req, downEnv, {} as any);
+      expect(res.status).toBe(200);
+      const data: any = await res.json();
+      expect(data.degraded).toBe(true);
+      expect(data.spans.some((s: any) => s.type === "EMAIL")).toBe(true);
+    });
+
+    test("POST /detect without allowDegraded still fails closed with 503", async () => {
+      const downEnv = {
+        ...env,
+        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
+      };
+      const req = new Request("https://trust.internal/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "email jane@example.com" }),
+      });
+      const res = await authenticatedFetch(req, downEnv, {} as any);
+      expect(res.status).toBe(503);
+    });
+
+    test("TRUST_FORCE_AI_FAILURE injects a 503-shaped outage on every inference path", async () => {
+      const injectedEnv = { ...env, TRUST_FORCE_AI_FAILURE: "1" };
+      const post = (path: string, body: unknown) =>
+        authenticatedFetch(
+          new Request(`https://trust.internal${path}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+          injectedEnv,
+          {} as any
+        );
+      // Without the flag the injected outage fails closed on both paths.
+      expect((await post("/detect", { text: "email jane@example.com" })).status).toBe(503);
+      expect((await post("/moderate", { text: "hello world" })).status).toBe(503);
+      // With allowDegraded both paths answer degraded.
+      const det: any = await (await post("/detect", { text: "email jane@example.com", allowDegraded: true })).json();
+      expect(det.degraded).toBe(true);
+      const mod: any = await (await post("/moderate", { text: "hello world", allowDegraded: true })).json();
+      expect(mod.degraded).toBe(true);
+      // Health reports the injected outage.
+      const health: any = await (
+        await authenticatedFetch(new Request("https://trust.internal/health"), injectedEnv, {} as any)
+      ).json();
+      expect(health.status).toBe("degraded");
+      expect(health.ai).toBe("unavailable");
+    });
+
+    describe("server Gemini key injection", () => {
+      const realFetch = globalThis.fetch;
+      afterEach(() => {
+        globalThis.fetch = realFetch;
+      });
+      const geminiOk = (text: string) => ({
+        ok: true,
+        json: async () => ({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] }),
+      });
+      const downAi = { run: async () => { throw new Error("503 Service Unavailable"); } } as any;
+
+      test("worker env key drives the Gemini leg on both HTTP paths", async () => {
+        const keyEnv = { ...env, GOOGLE_API_KEY: "server-key" };
+        globalThis.fetch = (async (url: any, init: any) => {
+          expect(init.headers["x-goog-api-key"]).toBe("server-key");
+          return geminiOk(
+            JSON.stringify(init.body).includes("safety classifier")
+              ? '{"safe": true, "codes": []}'
+              : '[{"text": "Jane Doe", "type": "PERSON"}]'
+          );
+        }) as any;
+        const post = (path: string, body: unknown) =>
+          authenticatedFetch(
+            new Request(`https://trust.internal${path}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            }),
+            keyEnv,
+            {} as any
+          );
+        // Point the env AI at the outage; Gemini must answer full-fidelity.
+        (keyEnv as any).AI = downAi;
+        const detRes = await post("/detect", { text: "contact Jane Doe" });
+        expect(detRes.status).toBe(200);
+        const det: any = await detRes.json();
+        expect(det.degraded ?? false).toBe(false);
+        expect(det.models).toContain("gemini-3.5-flash-lite");
+        expect(det.spans.some((s: any) => s.type === "PERSON" && s.source === "gemini")).toBe(true);
+        const modRes = await post("/moderate", { text: "hello world" });
+        expect(modRes.status).toBe(200);
+        const mod: any = await modRes.json();
+        expect(mod.degraded ?? false).toBe(false);
+        expect(mod.models).toContain("gemini-3.5-flash-lite");
+      });
+
+      test("caller-supplied Gemini keys are ignored (server key or nothing)", async () => {
+        let calls = 0;
+        globalThis.fetch = (async () => {
+          calls++;
+          return geminiOk("[]");
+        }) as any;
+        const noKeyEnv = { ...env, AI: downAi, GOOGLE_API_KEY: undefined };
+        const entrypoint = new TrustLayerWorkerEntrypoint({} as any, noKeyEnv);
+        await expect(entrypoint.detect("contact Jane Doe", { geminiKey: "caller-key" } as any)).rejects.toThrow();
+        await expect(entrypoint.moderate("hello world", { geminiKey: "caller-key" } as any)).rejects.toThrow();
+        expect(calls).toBe(0);
+      });
+    });
+
+    test("degraded detect results are never cached", async () => {
+      const downEnv = {
+        ...env,
+        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
+      };
+      const post = () =>
+        authenticatedFetch(
+          new Request("https://trust.internal/detect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: "email jane@example.com", allowDegraded: true }),
+          }),
+          downEnv,
+          {} as any
+        );
+      const first: any = await (await post()).json();
+      const second: any = await (await post()).json();
+      expect(first.degraded).toBe(true);
+      expect(second.degraded).toBe(true);
+      expect(second.cached ?? false).toBe(false);
+    });
+
+    test("TrustLayerWorkerEntrypoint RPC detect() exposes models", async () => {
+      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+      const res = await entrypoint.detect("hello Alice");
+      expect(res.count).toBe(res.spans.length);
+      expect(res.models).toEqual([
+        "@cf/cloudflare/clef-flash",
+        "@cf/meta/llama-3.1-8b-instruct-fp8",
+      ]);
+    });
+
+    test("RPC detect() serves repeats from cache without inference", async () => {
+      let aiCalls = 0;
+      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
+      env.AI.run = (async (model: string, input: any) => {
+        aiCalls++;
+        return inner(model, input);
+      }) as any;
+      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+      const first = await entrypoint.detect("Cache me Alice");
+      expect(first.cached).toBeUndefined();
+      expect(aiCalls).toBeGreaterThan(0);
+      const before = aiCalls;
+      const second = await entrypoint.detect("Cache me Alice");
+      expect(second.cached).toBe(true);
+      expect(second.models).toEqual([]);
+      expect(aiCalls).toBe(before);
+      expect(second.spans).toEqual(first.spans);
+      expect(second.count).toBe(first.count);
+    });
+
+    test("RPC moderate() serves repeats from cache without inference", async () => {
+      let aiCalls = 0;
+      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
+      env.AI.run = (async (model: string, input: any) => {
+        aiCalls++;
+        return inner(model, input);
+      }) as any;
+      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+      const first = await entrypoint.moderate("Cache this verdict please");
+      expect(first.cached).toBeUndefined();
+      const before = aiCalls;
+      const second = await entrypoint.moderate("Cache this verdict please");
+      expect(second.cached).toBe(true);
+      expect(second.models).toEqual([]);
+      expect(aiCalls).toBe(before);
+      expect(second.safe).toBe(first.safe);
+      expect(second.action).toBe(first.action);
+      expect(second.findings).toEqual(first.findings);
+    });
+
+    test("cache keys isolate different options", async () => {
+      let aiCalls = 0;
+      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
+      env.AI.run = (async (model: string, input: any) => {
+        aiCalls++;
+        return inner(model, input);
+      }) as any;
+      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+      await entrypoint.detect("Option isolation Alice");
+      const afterFirst = aiCalls;
+      await entrypoint.detect("Option isolation Alice", { enabledTypes: ["PERSON"] });
+      expect(aiCalls).toBeGreaterThan(afterFirst); // different key: miss, not hit
+      await entrypoint.moderate("Option isolation verdict", { mode: "warn" });
+      const afterWarn = aiCalls;
+      await entrypoint.moderate("Option isolation verdict", { mode: "block" });
+      expect(aiCalls).toBeGreaterThan(afterWarn);
     });
   });
 });

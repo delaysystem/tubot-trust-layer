@@ -8,6 +8,7 @@ import {
 } from "./crypto";
 import {
   detectPii,
+  detectPiiInner,
   type DetectedSpan,
   type PiiType,
   type DetectOptions,
@@ -35,6 +36,18 @@ import {
   type ModerateOptions,
 } from "./moderator";
 import { TRUST_LAYER_TOOLS } from "./tools";
+import {
+  cacheDelete,
+  cacheGet,
+  cachePut,
+  detectCacheKey,
+  moderateCacheKey,
+  pruneCache,
+  rehydrateSpans,
+  stripSpanText,
+  stripVerdict,
+  type CachedVerdict,
+} from "./cache";
 
 // Safe dynamic imports for Cloudflare Workers runtime vs Bun testing
 let DurableObjectClass: any;
@@ -74,6 +87,10 @@ export interface MaskApiRequest {
   useGranite?: boolean;
   useLlama?: boolean;
   regexOnly?: boolean;
+  /** False forces the legacy Llama engines instead of clef-flash. */
+  useClef?: boolean;
+  /** True answers from local layers when every AI engine fails (degraded:true) instead of 503. */
+  allowDegraded?: boolean;
   moderate?: boolean;
   moderationMode?: "block" | "warn";
   allowedCategories?: string[];
@@ -126,6 +143,167 @@ function errorResponse(message: string, status = 400): Response {
 }
 
 /**
+ * D1-cached detection. Identical requests answer in milliseconds without
+ * inference; the cache is auxiliary — any cache/D1 failure bypasses to a
+ * direct call, while detection errors (413/503) still propagate. Degraded
+ * (local-only) results are never cached: only full-fidelity entries are stored.
+ */
+async function cachedDetect(
+  env: Env,
+  text: string,
+  options?: DetectOptions
+): Promise<{ spans: DetectedSpan[]; count: number; models: string[]; cached?: boolean; degraded?: boolean }> {
+  const direct = async () => {
+    // The Gemini leg always uses the server key; caller-supplied keys are ignored.
+    const { spans, meta } = await detectPiiInner(text, requestAi(env), { ...options, geminiKey: env.GOOGLE_API_KEY });
+    return { spans, count: spans.length, models: meta.models, ...(meta.degraded ? { degraded: true as const } : {}) };
+  };
+  if (!env.DB) return direct();
+  let key: string;
+  try {
+    await initDatabase(env.DB);
+    key = await detectCacheKey(text, options);
+    const hit = await cacheGet(env.DB, key);
+    if (hit) {
+      try {
+        const spans = rehydrateSpans(text, JSON.parse(hit).spans);
+        return { spans, count: spans.length, models: [], cached: true };
+      } catch {
+        await cacheDelete(env.DB, key).catch(() => null);
+      }
+    }
+  } catch {
+    return direct();
+  }
+  const result = await direct();
+  if (!result.degraded) {
+    await cachePut(env.DB, key!, JSON.stringify({ spans: stripSpanText(result.spans) })).catch(() => null);
+  }
+  return result;
+}
+
+/**
+ * D1-cached moderation. Same auxiliary-cache contract as cachedDetect;
+ * degraded (heuristic-only) verdicts are never cached.
+ */
+async function cachedModerate(
+  env: Env,
+  text: string,
+  options?: ModerateOptions
+): Promise<ModerateResult> {
+  const direct = () => moderateInput(text, requestAi(env), { ...options, geminiKey: env.GOOGLE_API_KEY });
+  if (!env.DB) return direct();
+  const started = performance.now();
+  let key: string;
+  try {
+    await initDatabase(env.DB);
+    key = await moderateCacheKey(text, options);
+    const hit = await cacheGet(env.DB, key);
+    if (hit) {
+      const verdict = JSON.parse(hit) as CachedVerdict;
+      if (
+        verdict &&
+        typeof verdict === "object" &&
+        typeof verdict.safe === "boolean" &&
+        Array.isArray(verdict.findings)
+      ) {
+        return {
+          ...verdict,
+          executionTimeMs: Math.max(0, Math.round((performance.now() - started) * 100) / 100),
+          models: [],
+          cached: true,
+        };
+      }
+      await cacheDelete(env.DB, key).catch(() => null);
+    }
+  } catch {
+    return direct();
+  }
+  const result = await direct();
+  if (!result.degraded) {
+    await cachePut(env.DB, key!, JSON.stringify(stripVerdict(result))).catch(() => null);
+  }
+  return result;
+}
+
+/**
+ * Fault-injection hook for fallback verification. When the operator sets
+ * TRUST_FORCE_AI_FAILURE=1, every inference call fails with a 503 shaped
+ * exactly like a real provider outage — proving the degraded path without
+ * waiting for an outage. Default off; never set in production.
+ */
+function requestAi(env: Env): Env["AI"] {
+  if (env.TRUST_FORCE_AI_FAILURE === "1") {
+    return {
+      run: async () => {
+        throw Object.assign(new Error("injected AI failure (TRUST_FORCE_AI_FAILURE)"), { status: 503 });
+      },
+    } as unknown as Env["AI"];
+  }
+  return env.AI;
+}
+
+/**
+ * Live health probe. Binding presence (`hasAI`) says nothing about provider
+ * reachability, so this runs one tiny clef moderation call and one `SELECT 1`
+ * against D1. The AI probe never throws: a bound-but-failing provider
+ * surfaces as `ai: "unavailable"` with `status: "degraded"`, telling
+ * callers degraded mode is the only working path.
+ */
+async function healthReport(env: Env) {
+  let ai: "ok" | "unavailable" | "unbound" = env.AI ? "unavailable" : "unbound";
+  let aiLatencyMs: number | null = null;
+  if (env.AI) {
+    const started = performance.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        moderateInput("ok", requestAi(env)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("probe timeout")), 8000);
+        }),
+      ]);
+      ai = "ok";
+      aiLatencyMs = Math.round((performance.now() - started) * 100) / 100;
+    } catch {
+      ai = "unavailable";
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+  let db: "ok" | "unavailable" | "unbound" = env.DB ? "unavailable" : "unbound";
+  if (env.DB) {
+    try {
+      await env.DB.prepare("SELECT 1").first();
+      db = "ok";
+    } catch {
+      db = "unavailable";
+    }
+  }
+  return {
+    status: ai === "unavailable" ? "degraded" : "healthy",
+    service: "tubot-trust-layer",
+    layers: ["regex", "rust-wasm-pii", "openredaction", "clef-flash", "llama-fallback", "residual-scan", "result-cache"],
+    models: {
+      pii: "@cf/cloudflare/clef-flash",
+      moderation: "@cf/cloudflare/clef-flash",
+    },
+    fallbackModels: {
+      pii: "@cf/meta/llama-3.1-8b-instruct-fp8",
+      moderation: "@cf/meta/llama-guard-3-8b",
+    },
+    degradedFallback: "local-layers",
+    model: "@cf/cloudflare/clef-flash",
+    hasD1: !!env.DB,
+    hasAI: !!env.AI,
+    hasGemini: !!env.GOOGLE_API_KEY,
+    ai,
+    aiLatencyMs,
+    db,
+  };
+}
+
+/**
  * Core Masking Workflow
  */
 export async function executeMasking(
@@ -163,9 +341,11 @@ export async function executeMasking(
       "Privacy Violations",
     ];
 
-    moderationResult = await moderateInput(moderationText, env.AI, {
+    moderationResult = await cachedModerate(env, moderationText, {
       mode: request.moderationMode || "block",
       allowedCategories,
+      useClef: request.useClef,
+      allowDegraded: request.allowDegraded,
     });
 
     if (moderationResult.action === "block") {
@@ -180,12 +360,16 @@ export async function executeMasking(
   }
 
   // 1. Detect PII using Llama + Rust/Wasm + OpenRedaction + Regex
-  const spans = await detectPii(request.text, env.AI, {
-    enabledTypes: request.entities,
-    useLlama: request.useLlama,
-    useGranite: request.regexOnly ? false : request.useGranite !== false,
-    regexOnly: request.regexOnly,
-  });
+  const spans = (
+    await cachedDetect(env, request.text, {
+      enabledTypes: request.entities,
+      useLlama: request.useLlama,
+      useGranite: request.regexOnly ? false : request.useGranite !== false,
+      regexOnly: request.regexOnly,
+      useClef: request.useClef,
+      allowDegraded: request.allowDegraded,
+    })
+  ).spans;
 
   // If no PII detected, return original text
   if (spans.length === 0) {
@@ -395,16 +579,15 @@ export class TrustLayerWorkerEntrypoint extends WorkerEntrypointClass {
   async detect(
     text: string,
     options?: DetectOptions
-  ): Promise<{ spans: DetectedSpan[]; count: number }> {
-    const spans = await detectPii(text, (this.env as Env).AI, options);
-    return { spans, count: spans.length };
+  ): Promise<{ spans: DetectedSpan[]; count: number; models: string[]; cached?: boolean; degraded?: boolean }> {
+    return cachedDetect(this.env as Env, text, options);
   }
 
   async moderate(
     text: string,
     options?: ModerateOptions
   ): Promise<ModerateResult> {
-    return moderateInput(text, (this.env as Env).AI, options);
+    return cachedModerate(this.env as Env, text, options);
   }
 }
 
@@ -427,16 +610,15 @@ export class MyDurableObject extends DurableObjectClass {
   async detect(
     text: string,
     options?: DetectOptions
-  ): Promise<{ spans: DetectedSpan[]; count: number }> {
-    const spans = await detectPii(text, (this.env as Env).AI, options);
-    return { spans, count: spans.length };
+  ): Promise<{ spans: DetectedSpan[]; count: number; models: string[]; cached?: boolean; degraded?: boolean }> {
+    return cachedDetect(this.env as Env, text, options);
   }
 
   async moderate(
     text: string,
     options?: ModerateOptions
   ): Promise<ModerateResult> {
-    return moderateInput(text, (this.env as Env).AI, options);
+    return cachedModerate(this.env as Env, text, options);
   }
 
   async sayHello(name: string): Promise<string> {
@@ -466,19 +648,7 @@ export const httpHandler = {
 
     // 2. Health & Status
     if (request.method === "GET" && (pathname === "/health" || pathname === "/status")) {
-      return json({
-        status: "healthy",
-        service: "tubot-trust-layer",
-        layers: ["regex", "rust-wasm-pii", "openredaction", "llama", "residual-scan"],
-        models: {
-          pii: "@cf/meta/llama-3.1-8b-instruct-fp8",
-          moderation: "@cf/meta/llama-guard-3-8b",
-        },
-        model: "@cf/meta/llama-3.1-8b-instruct-fp8",
-        hasD1: !!env.DB,
-        hasAI: !!env.AI,
-        timestamp: new Date().toISOString(),
-      });
+      return json({ ...(await healthReport(env)), timestamp: new Date().toISOString() });
     }
 
     // 3. AI Agent Tool Schemas
@@ -509,15 +679,19 @@ export const httpHandler = {
           mode?: "block" | "warn";
           heuristicOnly?: boolean;
           allowedCategories?: string[];
+          useClef?: boolean;
+          allowDegraded?: boolean;
         };
         if (!body.text || typeof body.text !== "string") {
           return errorResponse("Missing or invalid 'text' field in request body.", 400);
         }
         if (!env.AI && !body.heuristicOnly) return errorResponse("Workers AI binding unavailable", 503);
-        const result = await moderateInput(body.text, env.AI, {
+        const result = await cachedModerate(env, body.text, {
           mode: body.mode || "block",
           heuristicOnly: body.heuristicOnly,
           allowedCategories: body.allowedCategories,
+          useClef: body.useClef,
+          allowDegraded: body.allowDegraded,
         });
         const status = result.action === "block" ? 422 : 200;
         return json(result, status);
@@ -571,24 +745,33 @@ export const httpHandler = {
           useGranite?: boolean;
           useLlama?: boolean;
           regexOnly?: boolean;
+          useClef?: boolean;
+          clefThreshold?: number;
+          allowDegraded?: boolean;
         };
         if (!body.text || typeof body.text !== "string") {
           return errorResponse("Missing 'text' field in request body.", 400);
         }
 
         const start = performance.now();
-        const spans = await detectPii(body.text, env.AI, {
+        const result = await cachedDetect(env, body.text, {
           enabledTypes: body.entities,
           useLlama: body.useLlama,
           useGranite: body.regexOnly ? false : body.useGranite !== false,
           regexOnly: body.regexOnly,
+          useClef: body.useClef,
+          clefThreshold: body.clefThreshold,
+          allowDegraded: body.allowDegraded,
         });
         const elapsed = Math.round((performance.now() - start) * 100) / 100;
 
         return json({
           success: true,
-          spans,
-          count: spans.length,
+          spans: result.spans,
+          count: result.count,
+          models: result.models,
+          ...(result.cached === true ? { cached: true } : {}),
+          ...(result.degraded === true ? { degraded: true } : {}),
           executionTimeMs: elapsed,
         });
       } catch (err: any) {
@@ -632,7 +815,8 @@ export const httpHandler = {
           return errorResponse("D1 database binding DB not found", 500);
         }
         const pruned = await pruneExpiredRecords(env.DB);
-        return json({ success: true, prunedCount: pruned });
+        const cachePruned = await pruneCache(env.DB);
+        return json({ success: true, prunedCount: pruned, cachePrunedCount: cachePruned });
       } catch (err: any) {
         return errorResponse(err?.message || "Prune error", 500);
       }

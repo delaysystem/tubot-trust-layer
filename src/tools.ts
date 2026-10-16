@@ -109,7 +109,7 @@ export const DETECT_PII_TOOL = {
 export const MODERATE_CONTENT_TOOL = {
   name: "moderate_content",
   description:
-    "Inspects text and prompts for security exploits, prompt injections, jailbreaks, malicious payloads, cyberattacks, and content safety violations using Meta Llama Guard 3 8B and heuristic exploit filters.",
+    "Inspects text and prompts for security exploits, prompt injections, jailbreaks, malicious payloads, cyberattacks, and content safety violations using fast Clef-flash decision screening with Meta Llama Guard 3 fallback and heuristic exploit filters.",
   parameters: {
     type: "object",
     properties: {

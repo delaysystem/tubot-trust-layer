@@ -1,7 +1,10 @@
 /// <reference types="bun-types" />
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import {
+  buildClefPresenceQuestions,
+  clefPresenceScreen,
   detectPii,
+  detectPiiInner,
   graniteScan,
   isValidIpv6,
   isValidSsn,
@@ -227,6 +230,41 @@ Hope this helps!`,
 
     await expect(graniteScan("Some text", failingAi)).rejects.toThrow("Semantic PII detection unavailable");
   });
+
+  it("skips malformed and ungrounded entities without discarding valid spans", async () => {
+    const mockAi: any = {
+      run: async () => ({
+        response: JSON.stringify([
+          { text: "John Doe", type: "PERSON" },
+          { text: "Nobody Here", type: "PERSON" },
+          { text: "John Doe", type: "BOGUS" },
+          { text: "   ", type: "PERSON" },
+          null,
+        ]),
+      }),
+    };
+
+    const spans = await graniteScan("Hello John Doe.", mockAi);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].text).toBe("John Doe");
+    expect(spans[0].type).toBe("PERSON");
+  });
+
+  it("ignores bare identifiers while keeping natural-language names", async () => {
+    const mockAi: any = {
+      run: async () => ({
+        response: JSON.stringify([
+          { text: "John Doe", type: "PERSON" },
+          { text: "topicCandidates", type: "ORG" },
+          { text: "en", type: "PERSON" },
+        ]),
+      }),
+    };
+
+    const spans = await graniteScan("Hello John Doe.\ntopicCandidates\nen", mockAi);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].text).toBe("John Doe");
+  });
 });
 
 describe("Span Resolver & Merger", () => {
@@ -308,6 +346,37 @@ describe("Span Resolver & Merger", () => {
     expect(merged[0].type).toBe("PERSON");
     expect(merged[0].text).toBe("John Smith");
   });
+
+  it("trims overlapping semantic spans instead of widening deterministic ones", () => {
+    const text = "My email is alice@example.com. Thanks!";
+    const spans: DetectedSpan[] = [
+      {
+        text: "alice@example.com",
+        type: "EMAIL",
+        start: 12,
+        end: 29,
+        source: "regex",
+        confidence: 0.99,
+      },
+      {
+        text: "My email is alice@example.com. Thanks!",
+        type: "EMAIL",
+        start: 0,
+        end: 38,
+        source: "llama",
+        confidence: 0.9,
+      },
+    ];
+
+    const merged = mergeAndDeduplicateSpans(spans, text);
+    const exact = merged.find((s) => s.start === 12 && s.end === 29);
+    expect(exact?.type).toBe("EMAIL");
+    expect(exact?.source).toBe("regex");
+    expect(exact?.text).toBe("alice@example.com");
+    // Residue keeps coverage outside the deterministic span, still descending.
+    expect(merged[0].start).toBeGreaterThanOrEqual(merged[1].start);
+    for (const span of merged) expect(span.text).toBe(text.slice(span.start, span.end));
+  });
 });
 
 describe("detectPii (Integration)", () => {
@@ -344,5 +413,282 @@ describe("detectPii (Integration)", () => {
     expect(aiCalled).toBe(false);
     expect(spans).toHaveLength(1);
     expect(spans[0].type).toBe("EMAIL");
+  });
+});
+
+function screenPayload(high: Record<string, number> = {}, types: string[] = ["PERSON", "ADDRESS", "ORG", "DOB"]) {
+  const answers: Record<string, unknown> = {};
+  for (const type of types) {
+    answers[type] = { type: "noul", noul: high[type] ?? 0.02 };
+  }
+  return { model: "clef-flash", answers, usage: { input_tokens: 90, output_tokens: 0 } };
+}
+
+describe("Clef-flash presence screen (clefPresenceScreen)", () => {
+  it("builds one yes/no question per requested semantic type", () => {
+    const questions = buildClefPresenceQuestions(["PERSON", "DOB", "EMAIL"]);
+    expect(Object.keys(questions).sort()).toEqual(["DOB", "PERSON"]);
+    for (const q of Object.values(questions)) {
+      expect(q.type).toBe("noul");
+      expect(q.instructions.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("returns flagged types at or above threshold", async () => {
+    const mockAi: any = {
+      run: async () => screenPayload({ PERSON: 0.91, ORG: 0.4 }),
+    };
+    const flagged = await clefPresenceScreen("Alice works at Acme", mockAi, ["PERSON", "ADDRESS", "ORG", "DOB"]);
+    expect(flagged?.sort()).toEqual(["ORG", "PERSON"]);
+  });
+
+  it("returns null when Workers AI throws or answers are malformed", async () => {
+    const throwing: any = {
+      run: async () => {
+        throw new Error("Model not found");
+      },
+    };
+    expect(await clefPresenceScreen("text", throwing, ["PERSON"])).toBeNull();
+
+    const malformed: any = { run: async () => ({ response: "[]" }) };
+    expect(await clefPresenceScreen("text", malformed, ["PERSON"])).toBeNull();
+  });
+
+  it("returns [] without calling AI when no semantic types are requested", async () => {
+    let calls = 0;
+    const mockAi: any = {
+      run: async () => {
+        calls++;
+        return screenPayload();
+      },
+    };
+    expect(await clefPresenceScreen("text", mockAi, ["EMAIL"])).toEqual([]);
+    expect(calls).toBe(0);
+  });
+});
+
+describe("detectPii clef-flash gating", () => {
+  it("skips the NER call entirely when the screen finds nothing", async () => {
+    const calls: string[] = [];
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        if (model === "@cf/cloudflare/clef-flash") return screenPayload();
+        throw new Error("NER must not be called");
+      },
+    };
+
+    const spans = await detectPii("Reach me at user@example.com please.", mockAi);
+
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash"]);
+    expect(spans.map((s) => s.type)).toEqual(["EMAIL"]);
+  });
+
+  it("runs full NER when the screen flags and keeps deterministic spans", async () => {
+    const calls: Array<{ model: string; input: any }> = [];
+    const mockAi: any = {
+      run: async (model: string, input: any) => {
+        calls.push({ model, input });
+        if (model === "@cf/cloudflare/clef-flash") return screenPayload({ PERSON: 0.88 });
+        return { response: JSON.stringify([{ text: "Dr. Evelyn Reed", type: "PERSON" }]) };
+      },
+    };
+
+    const text = "Dr. Evelyn Reed can be reached at evelyn@clinic.org.";
+    const spans = await detectPii(text, mockAi);
+
+    expect(calls.map((c) => c.model)).toEqual([
+      "@cf/cloudflare/clef-flash",
+      "@cf/meta/llama-3.1-8b-instruct-fp8",
+    ]);
+    // The screen runs on the same protected text as NER: known PII masked.
+    expect(calls[0].input.state).not.toContain("evelyn@clinic.org");
+    expect(calls[0].input.state.length).toBe(text.length);
+    expect(calls[1].input.messages[1].content).not.toContain("evelyn@clinic.org");
+    const types = spans.map((s) => s.type);
+    expect(types).toContain("PERSON");
+    expect(types).toContain("EMAIL");
+  });
+
+  it("falls back to full legacy NER when the screen is unavailable", async () => {
+    const calls: string[] = [];
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        if (model === "@cf/cloudflare/clef-flash") throw new Error("503");
+        return { response: JSON.stringify([{ text: "Alice", type: "PERSON" }]) };
+      },
+    };
+
+    const spans = await detectPii("hello Alice", mockAi);
+
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash", "@cf/meta/llama-3.1-8b-instruct-fp8"]);
+    expect(spans.map((s) => s.type)).toContain("PERSON");
+  });
+
+  it("forces legacy always-run NER when useClef: false", async () => {
+    const calls: string[] = [];
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        return { response: "[]" };
+      },
+    };
+
+    await detectPii("nothing sensitive here", mockAi, { useClef: false });
+
+    expect(calls).toEqual(["@cf/meta/llama-3.1-8b-instruct-fp8"]);
+  });
+
+  it("resolves legacy-shaped AI responses through the NER fallback path", async () => {
+    // Old mocks answer every model with NER JSON: the screen sees a
+    // malformed payload and the full legacy NER path produces the spans.
+    const mockAi: any = {
+      run: async () => ({
+        response: JSON.stringify([{ text: "Dr. Evelyn Reed", type: "PERSON" }]),
+      }),
+    };
+    const spans = await detectPii("Dr. Evelyn Reed can be reached at evelyn@clinic.org.", mockAi);
+    const types = spans.map((s) => s.type);
+    expect(types).toContain("PERSON");
+    expect(types).toContain("EMAIL");
+  });
+
+  it("honors a custom clefThreshold instead of the default", async () => {
+    const mockAi: any = {
+      run: async (model: string) => {
+        if (model === "@cf/cloudflare/clef-flash") return screenPayload({ PERSON: 0.15 });
+        return { response: JSON.stringify([{ text: "Alice", type: "PERSON" }]) };
+      },
+    };
+    // Default threshold (0.2): 0.15 does not flag -> NER skipped.
+    const skipped = await detectPiiInner("hello Alice", mockAi);
+    expect(skipped.meta.models).toEqual(["@cf/cloudflare/clef-flash"]);
+    expect(skipped.spans.map((s) => s.type)).not.toContain("PERSON");
+    // Lower threshold (0.1): 0.15 flags -> full NER runs.
+    const flagged = await detectPiiInner("hello Alice", mockAi, { clefThreshold: 0.1 });
+    expect(flagged.meta.models).toEqual([
+      "@cf/cloudflare/clef-flash",
+      "@cf/meta/llama-3.1-8b-instruct-fp8",
+    ]);
+    expect(flagged.spans.map((s) => s.type)).toContain("PERSON");
+  });
+
+  it("falls back to the default threshold for invalid clefThreshold values", async () => {
+    const mockAi: any = {
+      run: async (model: string) => {
+        if (model === "@cf/cloudflare/clef-flash") return screenPayload({ PERSON: 0.15 });
+        return { response: "[]" };
+      },
+    };
+    for (const clefThreshold of [0, 1, -0.5, 99, NaN]) {
+      const result = await detectPiiInner("hello Alice", mockAi, { clefThreshold });
+      // Invalid -> default 0.2 -> 0.15 does not flag -> NER skipped.
+      expect(result.meta.models).toEqual(["@cf/cloudflare/clef-flash"]);
+    }
+  });
+
+  it("reports models: [] when no semantic types are requested", async () => {
+    let calls = 0;
+    const mockAi: any = {
+      run: async () => {
+        calls++;
+        return screenPayload();
+      },
+    };
+    const result = await detectPiiInner("user@example.com", mockAi, { enabledTypes: ["EMAIL"] });
+    expect(calls).toBe(0);
+    expect(result.meta.models).toEqual([]);
+    expect(result.spans.map((s) => s.type)).toEqual(["EMAIL"]);
+  });
+
+  it("reports models accurately across all engine paths", async () => {
+    // Skip path: screen clears -> [clef].
+    const skipAi: any = {
+      run: async (model: string) => {
+        if (model !== "@cf/cloudflare/clef-flash") throw new Error("NER must not run");
+        return screenPayload();
+      },
+    };
+    expect((await detectPiiInner("nothing here", skipAi)).meta.models).toEqual([
+      "@cf/cloudflare/clef-flash",
+    ]);
+    // Legacy-forced path: [llama].
+    const legacyAi: any = { run: async () => ({ response: "[]" }) };
+    expect((await detectPiiInner("nothing here", legacyAi, { useClef: false })).meta.models).toEqual([
+      "@cf/meta/llama-3.1-8b-instruct-fp8",
+    ]);
+    // Local-only path: [].
+    expect((await detectPiiInner("nothing here", legacyAi, { regexOnly: true })).meta.models).toEqual([]);
+  });
+});
+
+describe("detectPiiInner degraded fallback (allowDegraded)", () => {
+  const down: any = {
+    run: async () => {
+      throw new Error("503 Service Unavailable");
+    },
+  };
+
+  it("throws 503 by default when NER is unavailable", async () => {
+    await expect(detectPiiInner("contact Jane Doe", down)).rejects.toThrow();
+  });
+
+  it("returns local-layer spans with degraded:true when allowDegraded", async () => {
+    const { spans, meta } = await detectPiiInner("email me at jane@example.com", down, {
+      allowDegraded: true,
+    });
+    expect(meta.degraded).toBe(true);
+    expect(spans.some((s) => s.type === "EMAIL" && s.text === "jane@example.com")).toBe(true);
+  });
+
+  it("fails on misconfiguration even when allowDegraded (degrade on provider failure only)", async () => {
+    await expect(detectPiiInner("contact Jane Doe", null as any, { allowDegraded: true })).rejects.toThrow();
+  });
+});
+
+describe("detectPiiInner gemini cross-provider leg", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const geminiOk = (text: string) => ({
+    ok: true,
+    json: async () => ({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] }),
+  });
+  const down: any = {
+    run: async () => {
+      throw new Error("503 Service Unavailable");
+    },
+  };
+
+  it("falls over to Gemini NER when Workers AI NER fails", async () => {
+    globalThis.fetch = (async () => geminiOk('[{"text": "Jane Doe", "type": "PERSON"}]')) as any;
+    const { spans, meta } = await detectPiiInner("contact Jane Doe", down, { geminiKey: "k" });
+    expect(meta.degraded ?? false).toBe(false);
+    expect(meta.models).toContain("gemini-3.5-flash-lite");
+    const person = spans.find((s) => s.type === "PERSON");
+    expect(person?.text).toBe("Jane Doe");
+    expect(person?.source).toBe("gemini");
+  });
+
+  it("degrades only when Gemini also fails and allowDegraded is set", async () => {
+    globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
+    const degraded = await detectPiiInner("contact Jane Doe", down, { geminiKey: "k", allowDegraded: true });
+    expect(degraded.meta.degraded).toBe(true);
+    expect(degraded.meta.models).toContain("gemini-3.5-flash-lite");
+    await expect(detectPiiInner("contact Jane Doe", down, { geminiKey: "k" })).rejects.toThrow();
+  });
+
+  it("never calls Gemini when Workers AI NER answers", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return geminiOk("[]");
+    }) as any;
+    const workingAi: any = { run: async () => ({ response: "[]" }) };
+    const { meta } = await detectPiiInner("nothing here", workingAi, { useClef: false, geminiKey: "k" });
+    expect(meta.models).toEqual(["@cf/meta/llama-3.1-8b-instruct-fp8"]);
+    expect(calls).toBe(0);
   });
 });
