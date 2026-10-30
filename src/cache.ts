@@ -20,7 +20,10 @@ import { CLEF_SCREEN_THRESHOLD } from "./clef";
 import type { DetectedSpan, DetectOptions, PiiType } from "./detector";
 import type { ModerateOptions, ModerateResult } from "./moderator";
 
-export const CACHE_VERSION = "v1";
+/** v2 (2026-10-30): marginal clef-flash flags now require Llama Guard
+ * confirmation before blocking. The bump retires v1 rows, including the
+ * coin-flip block verdicts that wedged sessions via cache replay. */
+export const CACHE_VERSION = "v2";
 export const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 export const CACHE_SCHEMA_STATEMENTS = [

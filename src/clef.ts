@@ -22,6 +22,16 @@ export const CLEF_FLASH_MODEL_SELECTOR = "clef-flash";
  * deterministic attacks, so use the neutral 0.5 cutoff. */
 export const CLEF_MODERATE_THRESHOLD = 0.5;
 
+/** Confirm ceiling: a clef flag below this probability is a coin-flip at
+ * the model's own decision boundary, not a verdict — Llama Guard must
+ * confirm it before the turn blocks. Origin: 2026-10-30 incident, where a
+ * p=0.51 S14 false positive on benign chat history blocked that turn and,
+ * replayed from the 7-day verdict cache against frozen history, every
+ * later turn in the session; every Tier-2 block in the incident window
+ * scored 0.51-0.56. 0.7 clears that band with margin while
+ * high-confidence flags keep blocking directly. */
+export const CLEF_CONFIRM_THRESHOLD = 0.7;
+
 /** Detect: run the (slow, precise) NER fallback when P(yes) >= threshold.
  * Recall matters here (a miss leaks PII to downstream models), so bias
  * toward running NER. Calibrated 2026-10-15 against the live recall eval:

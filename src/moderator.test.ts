@@ -842,6 +842,70 @@ describe("moderateInput clef-flash wiring", () => {
   });
 });
 
+describe("moderateInput marginal-flag tiebreak (2026-10-30 incident)", () => {
+  const tiebreakAi = (llama: string | Error) => {
+    const calls: string[] = [];
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        if (model === "@cf/cloudflare/clef-flash") return clefPayload({ S14: 0.51 });
+        if (llama instanceof Error) throw llama;
+        return llama;
+      },
+    };
+    return { calls, mockAi };
+  };
+
+  it("clears a p=0.51 flag when Llama Guard confirms safe", async () => {
+    const { calls, mockAi } = tiebreakAi("safe");
+    const result = await moderateInput("benign chat history", mockAi);
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash", "@cf/meta/llama-guard-3-8b"]);
+    expect(result.safe).toBe(true);
+    expect(result.action).toBe("allow");
+    expect(result.findings).toHaveLength(0);
+    expect(result.models).toEqual(["@cf/cloudflare/clef-flash", "@cf/meta/llama-guard-3-8b"]);
+  });
+
+  it("keeps a p=0.51 flag when Llama Guard confirms unsafe", async () => {
+    const { calls, mockAi } = tiebreakAi("unsafe\nS14");
+    const result = await moderateInput("suspicious content", mockAi);
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash", "@cf/meta/llama-guard-3-8b"]);
+    expect(result.safe).toBe(false);
+    expect(result.action).toBe("block");
+    expect(result.categoryCodes).toContain("S14");
+  });
+
+  it("blocks high-confidence flags directly without consulting Llama", async () => {
+    const calls: string[] = [];
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        if (model === "@cf/cloudflare/clef-flash") return clefPayload({ S13: 0.93 });
+        throw new Error("Llama Guard must not be called");
+      },
+    };
+    const result = await moderateInput("exploit payload", mockAi);
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash"]);
+    expect(result.safe).toBe(false);
+    expect(result.action).toBe("block");
+  });
+
+  it("fails closed when the tiebreak engine is unreachable", async () => {
+    const { mockAi } = tiebreakAi(new Error("503"));
+    const result = await moderateInput("suspicious content", mockAi);
+    expect(result.safe).toBe(false);
+    expect(result.action).toBe("block");
+    expect(result.categoryCodes).toContain("S14");
+  });
+
+  it("reports the highest flagged probability for tiebreak decisions", async () => {
+    const mockAi: any = { run: async () => clefPayload({ S14: 0.51, S2: 0.56 }) };
+    expect((await clefGuardScan("text", mockAi))?.maxProbability).toBeCloseTo(0.56, 5);
+    const cleanAi: any = { run: async () => clefPayload() };
+    expect((await clefGuardScan("text", cleanAi))?.maxProbability).toBe(0);
+  });
+});
+
 describe("moderateInput degraded fallback (allowDegraded)", () => {
   const bothDown: any = {
     run: async () => {

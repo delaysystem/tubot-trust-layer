@@ -12,6 +12,7 @@
 
 import {
   clefDecide,
+  CLEF_CONFIRM_THRESHOLD,
   CLEF_FLASH_MODEL_ID,
   CLEF_MODERATE_THRESHOLD,
   type ClefNoulQuestion,
@@ -142,6 +143,9 @@ export interface ClefGuardResult {
   categoryCodes: string[];
   categories: string[];
   findings: ClefGuardFinding[];
+  /** Highest P(yes) across flagged categories; 0 when nothing flagged.
+   * Decides the marginal-flag tiebreak in moderateInput. */
+  maxProbability: number;
   rawResponse?: any;
 }
 
@@ -622,6 +626,7 @@ export async function clefGuardScan(
       categoryCodes: [],
       categories: [],
       findings: [],
+      maxProbability: 0,
     };
   }
 
@@ -634,6 +639,7 @@ export async function clefGuardScan(
   const findings: ClefGuardFinding[] = [];
   const categories: string[] = [];
   const categoryCodes: string[] = [];
+  let maxProbability = 0;
 
   for (const [code, info] of Object.entries(LLAMA_GUARD_CATEGORIES)) {
     const probability = decided.probabilities[code] ?? 0;
@@ -647,6 +653,7 @@ export async function clefGuardScan(
         detail: `${info.description} (clef-flash p=${probability.toFixed(2)})`,
         severity: info.severity,
       });
+      if (probability > maxProbability) maxProbability = probability;
     }
   }
 
@@ -655,6 +662,7 @@ export async function clefGuardScan(
     categoryCodes,
     categories: Array.from(new Set(categories)),
     findings,
+    maxProbability,
     rawResponse: decided.rawResponse,
   };
 }
@@ -708,6 +716,24 @@ export async function moderateInput(
     }
     if (clefVerdict) {
       tier2Findings = clefVerdict.findings;
+      // Marginal-flag tiebreak: every flag sits within noise of the 0.5
+      // decision boundary, so one model's coin-flip is not decisive —
+      // Llama Guard adjudicates before the turn blocks. A Llama "safe"
+      // drops the marginal flags; unsafe (or an unreachable Llama) keeps
+      // them, preserving today's fail-closed posture. Heuristic findings
+      // are deterministic and never enter the tiebreak.
+      if (
+        clefVerdict.findings.length > 0 &&
+        clefVerdict.maxProbability < CLEF_CONFIRM_THRESHOLD
+      ) {
+        models.push(LLAMA_GUARD_MODEL_ID);
+        try {
+          const tiebreak = await llamaGuardScan(text, ai);
+          if (tiebreak.safe) tier2Findings = [];
+        } catch {
+          // Tiebreak unavailable: keep the clef flags (fail closed).
+        }
+      }
     } else {
       models.push(LLAMA_GUARD_MODEL_ID);
       let guardVerdict: { findings: ModerateFinding[] } | null = null;
