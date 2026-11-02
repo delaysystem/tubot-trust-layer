@@ -1,0 +1,21 @@
+# Dependabot: weekly Monday updates, max 5 open PRs. Patch updates grouped;
+# dev dependencies grouped. Commit prefix matches this repo's Conventional
+# Commits style.
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      patch-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
