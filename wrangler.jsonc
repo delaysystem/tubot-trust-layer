@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tubot-trust-layer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-21",
+  "workers_dev": false,
+  "preview_urls": false,
+  "migrations": [
+    {
+      "new_sqlite_classes": [
+        "MyDurableObject"
+      ],
+      "tag": "v1"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "MyDurableObject",
+        "name": "MY_DURABLE_OBJECT"
+      }
+    ]
+  },
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-dashboard-db-staging",
+      "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    // Billing: automatic invocation logs + traces bill per persisted event
+    // (Oct 2026: ~21M events ≈ $0.72). App console logs still persist.
+    "logs": { "enabled": true, "invocation_logs": false },
+    "traces": { "enabled": false }
+  },
+  "upload_source_maps": true,
+  "build": {
+    "command": "bun run build:wasm"
+  }
+}
