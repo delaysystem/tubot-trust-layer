@@ -1,5 +1,19 @@
-import module from "./wasm/pii_engine.wasm";
+import wasmSource from "./wasm/pii_engine.wasm";
 import type { DetectedSpan, PiiType } from "./detector";
+
+// A `.wasm` import is a compiled Module under Workers, but Bun's test loader
+// can surface raw bytes or a filesystem path instead. Accept all three so the
+// scanner runs unchanged in every environment.
+const ModuleCtor = WebAssembly.Module as unknown as new (bytes: BufferSource) => WebAssembly.Module;
+function loadWasmModule(): WebAssembly.Module {
+  if (wasmSource instanceof WebAssembly.Module) return wasmSource;
+  if (typeof wasmSource === "string") {
+    const fs = require("node:fs");
+    return new ModuleCtor(fs.readFileSync(wasmSource));
+  }
+  return new ModuleCtor(wasmSource as unknown as BufferSource);
+}
+const module = loadWasmModule();
 
 type Exports = { memory: WebAssembly.Memory; pii_alloc(n: number): number;
   pii_free(p: number, n: number): void; pii_scan(p: number, n: number): number;
