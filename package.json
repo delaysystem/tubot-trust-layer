@@ -2,10 +2,10 @@
   "name": "tubot-trust-layer",
   "version": "0.0.0",
   "devDependencies": {
-    "@types/node": "^26.6.2",
-    "bun-types": "^1.4.2",
-    "typescript": "^5.5.2",
-    "wrangler": "^4.137.0"
+    "@types/node": "^26.6.6",
+    "bun-types": "^1.4.4",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.163.0"
   },
   "private": true,
   "scripts": {
