@@ -89,6 +89,23 @@ const SEMANTIC_TYPES: readonly PiiType[] = [
   "DOB",
 ];
 
+/** PII types the Rust/WASM engine can emit: Email, CreditCard, Ssn/Itin,
+ * IpAddress/Ipv6, and everything else mapped to FINANCIAL (see
+ * crates/pii_engine/src/lib.rs scan()). When enabledTypes excludes all of
+ * these the WASM pass cannot contribute a span and is skipped. Origin: COST-01. */
+const WASM_EMITTED_TYPES: readonly PiiType[] = [
+  "EMAIL",
+  "CREDIT_CARD",
+  "SSN",
+  "IP_ADDRESS",
+  "FINANCIAL",
+];
+
+/** Block character covering known PII before inference. Equal-length blocking
+ * preserves UTF-16 offsets so NER spans transfer unchanged. Pre-existing
+ * behavior, now named. Origin: COST-01. */
+const PII_BLOCK_CHAR = "█";
+
 /**
  * Validates a credit card number using the Luhn algorithm (mod 10).
  */
@@ -691,6 +708,29 @@ export function mergeAndDeduplicateSpans(
 /** Compatibility export for callers using the previous scanner name. */
 export const graniteScan = llamaScan;
 
+/**
+ * Covers spans with equal-length PII_BLOCK_CHAR runs in one linear pass.
+ * Replaces the per-span slice-concat loop (O(spans x textLen)); output is
+ * identical for non-overlapping spans and overlap-safe otherwise (a later
+ * span never re-covers an earlier block). Length-preserving, so grounded
+ * offsets transfer unchanged.
+ */
+export function blockSpans(text: string, spans: readonly DetectedSpan[]): string {
+  if (spans.length === 0) return text;
+  const ordered = [...spans].sort((a, b) => a.start - b.start || a.end - b.end);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const span of ordered) {
+    if (span.end <= cursor) continue;
+    const start = Math.max(span.start, cursor);
+    parts.push(text.slice(cursor, start));
+    parts.push(PII_BLOCK_CHAR.repeat(span.end - start));
+    cursor = span.end;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join("");
+}
+
 const CLEF_PRESENCE_QUESTIONS: Record<string, { instructions: string; yes: string; no: string }> = {
   PERSON: {
     instructions: "Does this text contain the name of a real individual person?",
@@ -817,16 +857,23 @@ export async function detectPiiInner(
   const models: string[] = [];
   const enabledTypes = options?.enabledTypes;
   if (new TextEncoder().encode(text).length > 16384) throw Object.assign(new Error("PII input exceeds 16 KiB"), { status: 413 });
+  // Blank input carries no spans: answer before the deterministic layers run
+  // (all three return [] on blank text, and merging [] is []).
+  if (!text.trim()) return { spans: [], meta: { models } };
   const useLlama = !options?.regexOnly && (options?.useLlama ?? options?.useGranite ?? true);
+  // The WASM pass only emits structural/financial types: skip the scan +
+  // JSON round-trip when no requested type can match it. Regex filters
+  // internally per type (already cheap); OpenRedaction early-outs inside.
+  const wantsWasm = !enabledTypes || enabledTypes.some((t) => WASM_EMITTED_TYPES.includes(t));
   const local = mergeAndDeduplicateSpans([
-    ...regexScan(text, enabledTypes), ...wasmScan(text, enabledTypes),
+    ...regexScan(text, enabledTypes),
+    ...(wantsWasm ? wasmScan(text, enabledTypes) : []),
     ...await openRedactionScan(text, enabledTypes),
   ], text);
-  if (!useLlama || !text.trim()) return { spans: local, meta: { models } };
+  if (!useLlama) return { spans: local, meta: { models } };
   if (!ai) throw Object.assign(new Error("Workers AI binding unavailable"), { status: 503 });
   // Equal-length blocking preserves UTF-16 offsets and hides known PII from inference.
-  let protectedText = text;
-  for (const span of local) protectedText = protectedText.slice(0,span.start) + "█".repeat(span.end-span.start) + protectedText.slice(span.end);
+  const protectedText = blockSpans(text, local);
   // Fast path: a single clef-flash decision round screens for semantic PII.
   // No flags -> skip the slow NER call entirely. Any flag -> full NER.
   // No screen verdict (null) -> legacy full NER.

@@ -7,6 +7,7 @@ import {
   generateEncryptionKey,
 } from "./crypto";
 import {
+  blockSpans,
   detectPii,
   detectPiiInner,
   type DetectedSpan,
@@ -243,6 +244,12 @@ function requestAi(env: Env): Env["AI"] {
   return env.AI;
 }
 
+/** Health-probe AI budget: the probe must answer promptly for load balancers,
+ * so past this the provider counts as unavailable. Origin: FLK-09
+ * (pre-existing 8s behavior, now named); the timed-out probe aborts so the
+ * loser stops before its next model round instead of running on. */
+const HEALTH_PROBE_TIMEOUT_MS = 8000;
+
 /**
  * Live health probe. Binding presence (`hasAI`) says nothing about provider
  * reachability, so this runs one tiny clef moderation call and one `SELECT 1`
@@ -255,12 +262,18 @@ async function healthReport(env: Env) {
   let aiLatencyMs: number | null = null;
   if (env.AI) {
     const started = performance.now();
+    const ctrl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        moderateInput("ok", requestAi(env)),
+        moderateInput("ok", requestAi(env), { signal: ctrl.signal }),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("probe timeout")), 8000);
+          timer = setTimeout(() => {
+            // Cancel the loser: its next stage check throws instead of
+            // spending another model round on an answer nobody waits for.
+            ctrl.abort();
+            reject(new Error("probe timeout"));
+          }, HEALTH_PROBE_TIMEOUT_MS);
         }),
       ]);
       ai = "ok";
@@ -319,8 +332,8 @@ export async function executeMasking(
   if (new TextEncoder().encode(request.text).length > 16384) throw Object.assign(new Error("PII input exceeds 16 KiB"), { status: 413 });
   if (!env.DB) throw Object.assign(new Error("D1 binding unavailable"), { status: 503 });
   const localSpans = await detectPii(request.text, undefined, { enabledTypes: request.entities, regexOnly: true });
-  let moderationText = request.text;
-  for (const span of localSpans) moderationText = moderationText.slice(0, span.start) + "█".repeat(span.end - span.start) + moderationText.slice(span.end);
+  // Linear single-pass blocking (was O(spans x textLen) slice-concat). Origin: COST-01.
+  const moderationText = blockSpans(request.text, localSpans);
 
   // Ensure D1 database schema is ready
   if (env.DB) {

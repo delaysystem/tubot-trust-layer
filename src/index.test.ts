@@ -156,6 +156,20 @@ describe("Trust Layer Worker End-to-End API", () => {
     expect(data.hasAI).toBe(true);
   });
 
+  test("GET /health answers degraded when AI hangs past the probe budget", async () => {
+    const hangEnv = {
+      ...env,
+      AI: { run: () => new Promise(() => {}) } as any,
+    };
+    const req = new Request("https://trust.internal/health");
+    const res = await authenticatedFetch(req, hangEnv, {} as any);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.status).toBe("degraded");
+    expect(data.ai).toBe("unavailable");
+    expect(data.hasAI).toBe(true);
+  }, 30000);
+
   test("GET /health stays healthy without an AI binding (heuristic-only config)", async () => {
     const noAiEnv = { ...env, AI: undefined as any };
     const req = new Request("https://trust.internal/health");

@@ -166,6 +166,13 @@ export interface ModerateOptions {
    * RPC/HTTP callers must not set it (the server overrides it).
    */
   geminiKey?: string;
+  /**
+   * Cancellation signal (health-probe timeout). The Workers AI binding takes
+   * no signal, so stages check between model rounds: an aborted probe throws
+   * before its next round instead of spending inference budget on an answer
+   * nobody waits for. Origin: FLK-09.
+   */
+  signal?: AbortSignal;
 }
 
 export interface GeminiGuardFinding {
@@ -709,6 +716,8 @@ export async function moderateInput(
   let tier2Findings: ModerateFinding[] = [];
   let degraded = false;
   if (ai && !options?.heuristicOnly) {
+    // Cancelled (health-probe timeout): stop before the first model round.
+    options?.signal?.throwIfAborted();
     let clefVerdict: ClefGuardResult | null = null;
     if (options?.useClef !== false) {
       models.push(CLEF_FLASH_MODEL_ID);
@@ -726,6 +735,8 @@ export async function moderateInput(
         clefVerdict.findings.length > 0 &&
         clefVerdict.maxProbability < CLEF_CONFIRM_THRESHOLD
       ) {
+        // Outside the try: an abort must propagate, not read as tiebreak-down.
+        options?.signal?.throwIfAborted();
         models.push(LLAMA_GUARD_MODEL_ID);
         try {
           const tiebreak = await llamaGuardScan(text, ai);
@@ -735,6 +746,8 @@ export async function moderateInput(
         }
       }
     } else {
+      // Outside the try: an abort must propagate, not read as engine-down.
+      options?.signal?.throwIfAborted();
       models.push(LLAMA_GUARD_MODEL_ID);
       let guardVerdict: { findings: ModerateFinding[] } | null = null;
       try {
@@ -744,6 +757,8 @@ export async function moderateInput(
         // Workers AI down: the cross-provider leg runs before giving up.
       }
       if (!guardVerdict && options?.geminiKey) {
+        // Outside the try: an abort must propagate, not read as Gemini-down.
+        options?.signal?.throwIfAborted();
         models.push(GEMINI_MODEL_ID);
         try {
           guardVerdict = await geminiGuardScan(text, options.geminiKey);

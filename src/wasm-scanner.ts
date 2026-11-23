@@ -46,6 +46,10 @@ export function wasmScan(text: string, enabledTypes?: PiiType[]): DetectedSpan[]
     input.fill(0);
     if (output) wasm.pii_free_result(output);
     wasm.pii_free(ptr, input.length);
-    new Uint8Array(wasm.memory.buffer).fill(0);
+    // No full-memory wipe (was O(memory) per request): this instance is
+    // request-local and discarded after the scan, so nothing can observe its
+    // heap afterwards; the Rust side already volatile-wipes the input
+    // (pii_free) and result (pii_free_result) buffers, the only tenant bytes
+    // addressable through the exports. Origin: COST-17.
   }
 }

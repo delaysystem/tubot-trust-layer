@@ -1012,3 +1012,56 @@ describe("moderateInput gemini cross-provider leg", () => {
     expect(calls).toBe(0);
   });
 });
+
+describe("moderateInput cancellation (FLK-09 signal)", () => {
+  it("a pre-aborted signal rejects before the first model round", async () => {
+    let aiCalls = 0;
+    const mockAi: any = {
+      run: async () => {
+        aiCalls++;
+        return "safe";
+      },
+    };
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const err = await moderateInput("hello world", mockAi, { signal: ctrl.signal }).then(
+      () => null,
+      (e) => e
+    );
+    expect(err).not.toBeNull();
+    expect(err.name).toBe("AbortError");
+    expect(aiCalls).toBe(0);
+  });
+
+  it("an abort between rounds stops the fallback leg instead of running it", async () => {
+    const calls: string[] = [];
+    const ctrl = new AbortController();
+    const mockAi: any = {
+      run: async (model: string) => {
+        calls.push(model);
+        ctrl.abort();
+        return "not-a-clef-payload";
+      },
+    };
+    // Clef answers malformed (null verdict) after the abort: the Llama
+    // fallback check must throw instead of spending a second model round.
+    const err = await moderateInput("hello world", mockAi, { signal: ctrl.signal }).then(
+      () => null,
+      (e) => e
+    );
+    expect(err).not.toBeNull();
+    expect(err.name).toBe("AbortError");
+    expect(calls).toEqual(["@cf/cloudflare/clef-flash"]);
+  });
+
+  it("a live (non-aborted) signal changes nothing", async () => {
+    const mockAi: any = { run: async () => clefPayload() };
+    const ctrl = new AbortController();
+    const result = await moderateInput("What are your business hours?", mockAi, {
+      signal: ctrl.signal,
+    });
+    expect(result.safe).toBe(true);
+    expect(result.action).toBe("allow");
+    expect(result.models).toEqual(["@cf/cloudflare/clef-flash"]);
+  });
+});

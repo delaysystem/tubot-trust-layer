@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { detectPii, llamaScan, mergeAndDeduplicateSpans, type DetectedSpan } from "./detector";
+import { blockSpans, detectPii, llamaScan, mergeAndDeduplicateSpans, type DetectedSpan } from "./detector";
 import { wasmScan } from "./wasm-scanner";
 import { openRedactionScan } from "./openredaction-scanner";
 import { maskText, unmaskText } from "./masker";
@@ -85,5 +85,57 @@ describe("layered PII protection", () => {
       const response=await worker.fetch(new Request("https://trust.internal/detect",{method:"POST",headers:{Authorization:authorization},body:'{"text":"hello"}'}),env as Env,{} as any);
       expect(response.status).toBe(401);
     }
+  });
+});
+
+describe("cheap-first detection (COST-01)", () => {
+  // Legacy per-span slice-concat loop, kept as the equivalence oracle for blockSpans.
+  function legacyBlock(text: string, spans: DetectedSpan[]): string {
+    let out = text;
+    for (const span of spans) out = out.slice(0, span.start) + "█".repeat(span.end - span.start) + out.slice(span.end);
+    return out;
+  }
+  const span = (start: number, end: number): DetectedSpan =>
+    ({ text: "", start, end, type: "EMAIL", source: "regex" });
+
+  test("blockSpans matches the legacy loop on overlapping, unsorted and adjacent spans", () => {
+    const text = "🔐 contact alice@clinic.org or bob@test.com today";
+    const cases: DetectedSpan[][] = [
+      [],
+      [span(11, 27)],
+      [span(11, 27), span(31, 43)],
+      [span(31, 43), span(11, 27)],
+      [span(11, 30), span(20, 43)],
+      [span(0, text.length)],
+      [span(5, 5)],
+    ];
+    for (const spans of cases) {
+      expect(blockSpans(text, spans)).toBe(legacyBlock(text, spans));
+    }
+  });
+
+  test("blockSpans preserves length and UTF-16 offsets past astral characters", () => {
+    const text = "🔐 漢字 alice@clinic.org";
+    const blocked = blockSpans(text, [span(text.indexOf("alice@"), text.indexOf("alice@") + "alice@clinic.org".length)]);
+    expect(blocked.length).toBe(text.length);
+    expect(blocked.indexOf("alice@")).toBe(-1);
+    expect(blocked.slice(0, text.indexOf("alice@"))).toBe(text.slice(0, text.indexOf("alice@")));
+  });
+
+  test("blank text answers [] before any scan runs (no AI needed)", async () => {
+    for (const blank of ["", "   ", "\n\t  "]) {
+      await expect(detectPii(blank, undefined, { regexOnly: true })).resolves.toEqual([]);
+      // No AI binding either: blank short-circuits before the binding check.
+      await expect(detectPii(blank)).resolves.toEqual([]);
+    }
+  });
+
+  test("semantic-only filters keep contract while skipping structural passes", async () => {
+    const text = "Alice wrote to alice@clinic.org";
+    // PERSON matches no deterministic layer: skips must answer [], not throw.
+    await expect(detectPii(text, undefined, { regexOnly: true, enabledTypes: ["PERSON"] })).resolves.toEqual([]);
+    // CUSTOM still reaches OpenRedaction (NI number is CUSTOM-only coverage).
+    const custom = await detectPii("National Insurance AB123456C", undefined, { regexOnly: true, enabledTypes: ["CUSTOM"] });
+    expect(custom.some(s => s.type === "CUSTOM" && s.text === "AB123456C")).toBe(true);
   });
 });

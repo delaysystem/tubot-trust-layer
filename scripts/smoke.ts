@@ -11,9 +11,17 @@ async function request(path: string, body?: unknown, method = "POST") {
   if (!response.ok) throw new Error(`Trust layer ${path} returned HTTP ${response.status}`);
   return response.json() as Promise<any>;
 }
+/** D1/SQLite string-literal quoting ('' doubling). Origin: SEC-26. */
+function sqliteQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 async function groundTruth(vaultId: string) {
   assert.match(vaultId, /^[0-9a-f-]{36}$/i);
-  const command = `SELECT (SELECT COUNT(*) FROM pii_vault WHERE vault_id = '${vaultId}') AS vaults, (SELECT COUNT(*) FROM pii_tokens WHERE vault_id = '${vaultId}') AS tokens, (SELECT COUNT(*) FROM pii_vault WHERE vault_id = '${vaultId}' AND encrypted_data NOT LIKE '%jane@clinic.org%') AS encrypted;`;
+  // UUID-validated above (hex + dashes only, so no quote can appear) and
+  // quoted for defense in depth: interpolation here is provably safe.
+  const id = sqliteQuote(vaultId);
+  const command = `SELECT (SELECT COUNT(*) FROM pii_vault WHERE vault_id = ${id}) AS vaults, (SELECT COUNT(*) FROM pii_tokens WHERE vault_id = ${id}) AS tokens, (SELECT COUNT(*) FROM pii_vault WHERE vault_id = ${id} AND encrypted_data NOT LIKE '%jane@clinic.org%') AS encrypted;`;
   const cli = Bun.spawn(["bunx", "wrangler", "d1", "execute", "DB", remote ? "--remote" : "--local", "--command", command, "--json"], { stdout: "pipe", stderr: "pipe" });
   const stdout = await new Response(cli.stdout).text();
   const stderr = await new Response(cli.stderr).text();
