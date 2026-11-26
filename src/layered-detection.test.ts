@@ -21,24 +21,25 @@ describe("layered PII protection", () => {
   });
   test("known structured PII is removed before any inference call", async () => {
     const text = "🔐 Alice wrote to alice@clinic.org and Alice replied.";
-    const models:string[]=[];
-    const ai:any={run:async(model:string,input:any)=>{
-      models.push(model);
-      if(model==="@cf/cloudflare/clef-flash"){
-        expect(input.state).not.toContain("alice@clinic.org");
-        expect(input.state.length).toBe(text.length);
-        return {model:"clef-flash",answers:{PERSON:{type:"noul",noul:0.95},ADDRESS:{type:"noul",noul:0.01},ORG:{type:"noul",noul:0.02},DOB:{type:"noul",noul:0.01}},usage:{input_tokens:80,output_tokens:0}};
-      }
-      expect(model).toBe("@cf/meta/llama-3.1-8b-instruct-fp8");
-      expect(input.messages[1].content).not.toContain("alice@clinic.org");
-      expect(input.messages[1].content.length).toBe(text.length);
-      return {response:'[{"text":"Alice","type":"PERSON"}]'};
-    }};
-    const masked=maskText(text,await detectPii(text,ai));
-    expect(models).toEqual(["@cf/cloudflare/clef-flash","@cf/meta/llama-3.1-8b-instruct-fp8"]);
-    expect(masked.maskedText).not.toContain("Alice");
-    expect(masked.maskedText).not.toContain("alice@clinic.org");
-    expect(unmaskText(masked.maskedText,masked.tokenMap).unmaskedText).toBe(text);
+    const realFetch = globalThis.fetch;
+    const seen: string[] = [];
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seen.push(body?.contents?.[0]?.parts?.[0]?.text ?? "");
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '[{"text":"Alice","type":"PERSON"}]' }] }, finishReason: "STOP" }] }) };
+    }) as any;
+    try {
+      const throwingAi: any = { run: async (): Promise<never> => { throw new Error("WORKERS_AI_MUST_NOT_BE_CALLED"); } };
+      const masked=maskText(text,await detectPii(text,throwingAi,{geminiKey:"k"}));
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).not.toContain("alice@clinic.org");
+      expect(seen[0].length).toBe(text.length);
+      expect(masked.maskedText).not.toContain("Alice");
+      expect(masked.maskedText).not.toContain("alice@clinic.org");
+      expect(unmaskText(masked.maskedText,masked.tokenMap).unmaskedText).toBe(text);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
   test("deterministic spans keep exact boundaries while semantic residue keeps coverage", () => {
     // Unioning would widen the exact EMAIL match to the whole sentence and
@@ -53,7 +54,7 @@ describe("layered PII protection", () => {
   });
   test("upstream errors and empty responses fail closed", async () => {
     await expect(llamaScan("hello",{run:async()=>({response:""})} as any)).rejects.toThrow("Semantic PII detection unavailable");
-    await expect(detectPii("hello")).rejects.toThrow("Workers AI binding unavailable");
+    await expect(detectPii("hello")).rejects.toThrow("NER provider unavailable");
     await expect(detectPii("x".repeat(16385),undefined,{regexOnly:true})).rejects.toThrow("16 KiB");
   });
   test("chatty no-entity replies resolve to no semantic spans", async () => {

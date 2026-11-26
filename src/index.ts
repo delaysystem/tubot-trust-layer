@@ -36,6 +36,7 @@ import {
   type ModerateResult,
   type ModerateOptions,
 } from "./moderator";
+import { GEMINI_MODEL_ID } from "./gemini";
 import { TRUST_LAYER_TOOLS } from "./tools";
 import {
   cacheDelete,
@@ -308,22 +309,25 @@ function requestAi(env: Env): Env["AI"] {
 const HEALTH_PROBE_TIMEOUT_MS = 8000;
 
 /**
- * Live health probe. Binding presence (`hasAI`) says nothing about provider
- * reachability, so this runs one tiny clef moderation call and one `SELECT 1`
- * against D1. The AI probe never throws: a bound-but-failing provider
+ * Live health probe. Key presence says nothing about provider
+ * reachability, so this runs one tiny gemini moderation call and one
+ * `SELECT 1` against D1. The probe never throws: a failing provider
  * surfaces as `ai: "unavailable"` with `status: "degraded"`, telling
  * callers degraded mode is the only working path.
  */
 async function healthReport(env: Env) {
-  let ai: "ok" | "unavailable" | "unbound" = env.AI ? "unavailable" : "unbound";
+  // Workers AI disabled: Tier-2 health is the Gemini leg (or local-only
+  // degradation), never the vestigial AI binding. Always probe; a missing
+  // key fails fast (no model round) and reports unavailable/degraded.
+  let ai: "ok" | "unavailable" | "unbound" = "unavailable";
   let aiLatencyMs: number | null = null;
-  if (env.AI) {
+  {
     const started = performance.now();
     const ctrl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        moderateInput("ok", requestAi(env), { signal: ctrl.signal }),
+        moderateInput("ok", requestAi(env), { signal: ctrl.signal, geminiKey: env.GOOGLE_API_KEY }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             // Cancel the loser: its next stage check throws instead of
@@ -353,17 +357,17 @@ async function healthReport(env: Env) {
   return {
     status: ai === "unavailable" ? "degraded" : "healthy",
     service: "tubot-trust-layer",
-    layers: ["regex", "rust-wasm-pii", "openredaction", "clef-flash", "llama-fallback", "residual-scan", "result-cache"],
+    layers: ["regex", "rust-wasm-pii", "openredaction", "gemini-ner", "residual-scan", "result-cache"],
     models: {
-      pii: "@cf/cloudflare/clef-flash",
-      moderation: "@cf/cloudflare/clef-flash",
+      pii: GEMINI_MODEL_ID,
+      moderation: GEMINI_MODEL_ID,
     },
     fallbackModels: {
-      pii: "@cf/meta/llama-3.1-8b-instruct-fp8",
-      moderation: "@cf/meta/llama-guard-3-8b",
+      pii: "local-layers",
+      moderation: "local-layers",
     },
     degradedFallback: "local-layers",
-    model: "@cf/cloudflare/clef-flash",
+    model: GEMINI_MODEL_ID,
     hasD1: !!env.DB,
     hasAI: !!env.AI,
     hasGemini: !!env.GOOGLE_API_KEY,

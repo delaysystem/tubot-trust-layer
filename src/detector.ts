@@ -806,49 +806,8 @@ export async function clefPresenceScreen(
 
 /**
  * Main detection entry point with engine attribution.
- * Returns the spans plus the Workers AI models called, in order, so
- * callers can tell a clef-flash skip from a legacy NER round.
+ * Returns the spans plus the models called, in order.
  */
-/**
- * Semantic NER with cross-provider fallback: Llama NER, then Gemini when a
- * server key is configured, then degraded local spans (allowDegraded) or
- * the original 503. Both NER rounds ground against the equal-length
- * protected text, so offsets transfer unchanged. Only 503 (provider
- * unavailable) falls over; other errors propagate untouched.
- */
-async function nerWithFallback(
-  protectedText: string,
-  text: string,
-  ai: Ai,
-  local: DetectedSpan[],
-  models: string[],
-  enabledTypes: PiiType[] | undefined,
-  options: DetectOptions | undefined
-): Promise<{ spans: DetectedSpan[]; meta: DetectMeta }> {
-  models.push(LLAMA_NER_MODEL_ID);
-  try {
-    const semantic = await llamaScan(protectedText, ai, enabledTypes);
-    return { spans: mergeAndDeduplicateSpans([...local, ...semantic], text), meta: { models } };
-  } catch (e) {
-    if ((e as any)?.status !== 503) throw e;
-    if (options?.geminiKey) {
-      models.push(GEMINI_MODEL_ID);
-      try {
-        const entities = await geminiNerScan(protectedText, options.geminiKey);
-        const semantic = processLlamaEntities(entities, protectedText, enabledTypes).map((s) => ({
-          ...s,
-          source: "gemini" as const,
-        }));
-        return { spans: mergeAndDeduplicateSpans([...local, ...semantic], text), meta: { models } };
-      } catch {
-        // Every NER engine failed; degrade or throw below.
-      }
-    }
-    if (options?.allowDegraded !== true) throw e;
-    return { spans: local, meta: { models, degraded: true } };
-  }
-}
-
 export async function detectPiiInner(
   text: string,
   ai?: Ai,
@@ -871,27 +830,35 @@ export async function detectPiiInner(
     ...await openRedactionScan(text, enabledTypes),
   ], text);
   if (!useLlama) return { spans: local, meta: { models } };
-  if (!ai) throw Object.assign(new Error("Workers AI binding unavailable"), { status: 503 });
+  // Workers AI disabled (owner-ordered 2026-11-26): the clef screen and
+  // llama NER legs are removed. Semantic NER runs on the direct Gemini
+  // path when keyed; otherwise local-only, degraded-gated exactly like a
+  // total engine outage was. (The `ai` param and useClef/useLlama options
+  // stay for signature compatibility; useLlama still gates semantic NER.)
+  void ai;
+  // No semantic types requested: deterministic spans suffice, no model call.
+  const screenTypes = (enabledTypes ?? [...SEMANTIC_TYPES]).filter((t) => SEMANTIC_TYPES.includes(t));
+  if (screenTypes.length === 0) return { spans: local, meta: { models } };
   // Equal-length blocking preserves UTF-16 offsets and hides known PII from inference.
   const protectedText = blockSpans(text, local);
-  // Fast path: a single clef-flash decision round screens for semantic PII.
-  // No flags -> skip the slow NER call entirely. Any flag -> full NER.
-  // No screen verdict (null) -> legacy full NER.
-  if (options?.useClef !== false) {
-    const screenTypes = (enabledTypes ?? [...SEMANTIC_TYPES]).filter((t) => SEMANTIC_TYPES.includes(t));
-    if (screenTypes.length === 0) return { spans: local, meta: { models } };
-    models.push(CLEF_MODEL_ID);
-    const screened = await clefPresenceScreen(protectedText, ai, screenTypes, options?.clefThreshold);
-    if (screened) {
-      if (screened.length === 0) return { spans: local, meta: { models } };
-      // Any flag runs FULL NER over all enabled semantic types. Narrowing NER
-      // to flagged types would save nothing (same prompt, same generation)
-      // and drops spans when the screen and NER disagree on the label
-      // (verified live: screen flags ADDRESS for "Paris", NER labels it ORG).
-      return nerWithFallback(protectedText, text, ai, local, models, enabledTypes, options);
+  if (options?.geminiKey) {
+    models.push(GEMINI_MODEL_ID);
+    try {
+      const entities = await geminiNerScan(protectedText, options.geminiKey);
+      const semantic = processLlamaEntities(entities, protectedText, enabledTypes).map((s) => ({
+        ...s,
+        source: "gemini" as const,
+      }));
+      return { spans: mergeAndDeduplicateSpans([...local, ...semantic], text), meta: { models } };
+    } catch (e) {
+      if (options?.allowDegraded !== true) throw e;
+      return { spans: local, meta: { models, degraded: true } };
     }
   }
-  return nerWithFallback(protectedText, text, ai, local, models, enabledTypes, options);
+  if (options?.allowDegraded !== true) {
+    throw Object.assign(new Error("NER provider unavailable"), { status: 503 });
+  }
+  return { spans: local, meta: { models, degraded: true } };
 }
 
 /**

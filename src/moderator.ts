@@ -706,73 +706,34 @@ export async function moderateInput(
   // Tier 1: Fast Heuristic Scanner (< 1ms)
   const heuristicFindings = heuristicExploitScan(text);
 
-  // Tier 2: Clef-flash decisions (if AI binding provided and not heuristicOnly),
-  // with legacy Llama Guard 3 as the automatic fallback. A clef verdict of
-  // "safe" (valid, empty findings) must NOT trigger the fallback: only fall
-  // back when clef produced no verdict at all (null). When both Workers AI
-  // engines fail and a Gemini key is configured, Gemini answers before the
-  // verdict degrades (allowDegraded) or throws 503.
+  // Tier 2: model safety verdicts (unless heuristicOnly). Workers AI
+  // disabled (owner-ordered 2026-11-26): the clef + llama-guard legs are
+  // removed. Gemini answers Tier 2 directly when keyed, else the
+  // pre-existing degrade-or-503 tail. (`ai` stays for signature
+  // compatibility.) Heuristic findings are deterministic and never
+  // enter model adjudication.
+  void ai;
   const models: string[] = [];
   let tier2Findings: ModerateFinding[] = [];
   let degraded = false;
-  if (ai && !options?.heuristicOnly) {
-    // Cancelled (health-probe timeout): stop before the first model round.
+  if (!options?.heuristicOnly) {
+    // Cancelled (health-probe timeout): stop before the model round.
     options?.signal?.throwIfAborted();
-    let clefVerdict: ClefGuardResult | null = null;
-    if (options?.useClef !== false) {
-      models.push(CLEF_FLASH_MODEL_ID);
-      clefVerdict = await clefGuardScan(text, ai);
-    }
-    if (clefVerdict) {
-      tier2Findings = clefVerdict.findings;
-      // Marginal-flag tiebreak: every flag sits within noise of the 0.5
-      // decision boundary, so one model's coin-flip is not decisive —
-      // Llama Guard adjudicates before the turn blocks. A Llama "safe"
-      // drops the marginal flags; unsafe (or an unreachable Llama) keeps
-      // them, preserving today's fail-closed posture. Heuristic findings
-      // are deterministic and never enter the tiebreak.
-      if (
-        clefVerdict.findings.length > 0 &&
-        clefVerdict.maxProbability < CLEF_CONFIRM_THRESHOLD
-      ) {
-        // Outside the try: an abort must propagate, not read as tiebreak-down.
-        options?.signal?.throwIfAborted();
-        models.push(LLAMA_GUARD_MODEL_ID);
-        try {
-          const tiebreak = await llamaGuardScan(text, ai);
-          if (tiebreak.safe) tier2Findings = [];
-        } catch {
-          // Tiebreak unavailable: keep the clef flags (fail closed).
-        }
-      }
-    } else {
-      // Outside the try: an abort must propagate, not read as engine-down.
-      options?.signal?.throwIfAborted();
-      models.push(LLAMA_GUARD_MODEL_ID);
-      let guardVerdict: { findings: ModerateFinding[] } | null = null;
+    let guardVerdict: { findings: ModerateFinding[] } | null = null;
+    if (options?.geminiKey) {
+      models.push(GEMINI_MODEL_ID);
       try {
-        const lgResult = await llamaGuardScan(text, ai);
-        if (!lgResult.error) guardVerdict = lgResult;
+        guardVerdict = await geminiGuardScan(text, options.geminiKey);
       } catch {
-        // Workers AI down: the cross-provider leg runs before giving up.
+        // Gemini down: degrade or throw below.
       }
-      if (!guardVerdict && options?.geminiKey) {
-        // Outside the try: an abort must propagate, not read as Gemini-down.
-        options?.signal?.throwIfAborted();
-        models.push(GEMINI_MODEL_ID);
-        try {
-          guardVerdict = await geminiGuardScan(text, options.geminiKey);
-        } catch {
-          // Every Tier-2 engine failed; degrade or throw below.
-        }
-      }
-      if (guardVerdict) {
-        tier2Findings = guardVerdict.findings;
-      } else if (options?.allowDegraded !== true) {
-        throw Object.assign(new Error("Safety inference unavailable"), { status: 503 });
-      } else {
-        degraded = true;
-      }
+    }
+    if (guardVerdict) {
+      tier2Findings = guardVerdict.findings;
+    } else if (options?.allowDegraded !== true) {
+      throw Object.assign(new Error("Safety inference unavailable"), { status: 503 });
+    } else {
+      degraded = true;
     }
   }
 

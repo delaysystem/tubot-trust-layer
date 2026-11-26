@@ -86,10 +86,25 @@ function createMockD1Database(): D1Database {
   return mockDb as D1Database;
 }
 
+const realFetch = globalThis.fetch;
+function geminiEntities(entities: unknown) {
+  return {
+    ok: true,
+    json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(entities) }] }, finishReason: "STOP" }] }),
+  };
+}
+function geminiVerdict(safe: boolean, codes: string[]) {
+  return {
+    ok: true,
+    json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify({ safe, codes }) }] }, finishReason: "STOP" }] }),
+  };
+}
+
 function createMockEnv(db: D1Database): Env {
   return {
     DB: db,
     API_TOKEN: "test-access-token",
+    GOOGLE_API_KEY: "test-key",
     AI: {
       async run(model: string, input: any) {
         if (model === "@cf/meta/llama-guard-3-8b") {
@@ -129,6 +144,15 @@ describe("Trust Layer Worker End-to-End API", () => {
   beforeEach(() => {
     db = createMockD1Database();
     env = createMockEnv(db);
+    // Default: Gemini answers empty (safe verdict / no entities), routed
+    // by prompt kind; tests needing findings override fetch per-case.
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = String(init?.body ?? "");
+      return body.includes("safety classifier") ? geminiVerdict(true, []) : geminiEntities([]);
+    }) as any;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
   });
 
   test("GET /health returns healthy status and service info", async () => {
@@ -139,45 +163,47 @@ describe("Trust Layer Worker End-to-End API", () => {
     const data: any = await res.json();
     expect(data.status).toBe("healthy");
     expect(data.service).toBe("tubot-trust-layer");
-    expect(data.model).toBe("@cf/cloudflare/clef-flash");
+    expect(data.model).toBe("gemini-3.5-flash-lite");
   });
 
-  test("GET /health reports degraded when AI is bound but failing", async () => {
-    const downEnv = {
-      ...env,
-      AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
-    };
+  test("GET /health reports degraded when Gemini is failing", async () => {
+    globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
     const req = new Request("https://trust.internal/health");
-    const res = await authenticatedFetch(req, downEnv, {} as any);
+    const res = await authenticatedFetch(req, env, {} as any);
     expect(res.status).toBe(200);
     const data: any = await res.json();
     expect(data.status).toBe("degraded");
     expect(data.ai).toBe("unavailable");
-    expect(data.hasAI).toBe(true);
   });
 
-  test("GET /health answers degraded when AI hangs past the probe budget", async () => {
-    const hangEnv = {
-      ...env,
-      AI: { run: () => new Promise(() => {}) } as any,
-    };
+  test("GET /health answers degraded when Gemini hangs past the probe budget", async () => {
+    globalThis.fetch = ((_url: any, _init: any) => new Promise(() => {})) as any;
     const req = new Request("https://trust.internal/health");
-    const res = await authenticatedFetch(req, hangEnv, {} as any);
+    const res = await authenticatedFetch(req, env, {} as any);
     expect(res.status).toBe(200);
     const data: any = await res.json();
     expect(data.status).toBe("degraded");
     expect(data.ai).toBe("unavailable");
-    expect(data.hasAI).toBe(true);
   }, 30000);
 
-  test("GET /health stays healthy without an AI binding (heuristic-only config)", async () => {
+  test("GET /health stays healthy without an AI binding when keyed (binding vestigial)", async () => {
     const noAiEnv = { ...env, AI: undefined as any };
     const req = new Request("https://trust.internal/health");
     const res = await authenticatedFetch(req, noAiEnv, {} as any);
     expect(res.status).toBe(200);
     const data: any = await res.json();
     expect(data.status).toBe("healthy");
-    expect(data.ai).toBe("unbound");
+    expect(data.ai).toBe("ok");
+  });
+
+  test("GET /health reports degraded without a Gemini key", async () => {
+    const noKeyEnv = { ...env, GOOGLE_API_KEY: undefined as any };
+    const req = new Request("https://trust.internal/health");
+    const res = await authenticatedFetch(req, noKeyEnv, {} as any);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.status).toBe("degraded");
+    expect(data.ai).toBe("unavailable");
   });
 
   test("GET /health reports Gemini fallback configuration", async () => {
@@ -204,6 +230,11 @@ describe("Trust Layer Worker End-to-End API", () => {
   });
 
   test("executeMasking and executeUnmasking perform full roundtrip with zero-knowledge key", async () => {
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = String(init?.body ?? "");
+      if (body.includes("safety classifier")) return geminiVerdict(true, []);
+      return geminiEntities([{ text: "John Doe", type: "PERSON" }]);
+    }) as any;
     const rawText =
       "Hello, my name is John Doe, email is john.doe@example.com, and phone is +1-555-867-5309.";
 
@@ -306,15 +337,15 @@ describe("Trust Layer Worker End-to-End API", () => {
   });
 
   describe("Input Moderation & Exploit Shield Integration", () => {
-    test("GET /health reports clef-flash primary models with Llama fallbacks", async () => {
+    test("GET /health reports gemini Tier 2 models with local-layers fallback", async () => {
       const req = new Request("https://trust.internal/health");
       const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(200);
       const data: any = await res.json();
-      expect(data.models?.pii).toBe("@cf/cloudflare/clef-flash");
-      expect(data.models?.moderation).toBe("@cf/cloudflare/clef-flash");
-      expect(data.fallbackModels?.pii).toBe("@cf/meta/llama-3.1-8b-instruct-fp8");
-      expect(data.fallbackModels?.moderation).toBe("@cf/meta/llama-guard-3-8b");
+      expect(data.models?.pii).toBe("gemini-3.5-flash-lite");
+      expect(data.models?.moderation).toBe("gemini-3.5-flash-lite");
+      expect(data.fallbackModels?.pii).toBe("local-layers");
+      expect(data.fallbackModels?.moderation).toBe("local-layers");
     });
 
     test("GET /tool-definitions includes moderate_content schema", async () => {
@@ -364,7 +395,8 @@ describe("Trust Layer Worker End-to-End API", () => {
       expect(data.categories).toContain("Code Interpreter Abuse / System Manipulation");
     });
 
-    test("POST /moderate flags semantic cyberattack via Llama Guard 3", async () => {
+    test("POST /moderate flags semantic cyberattack via Gemini", async () => {
+      globalThis.fetch = (async () => geminiVerdict(false, ["S13"])) as any;
       const req = new Request("https://trust.internal/moderate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -451,15 +483,10 @@ describe("Trust Layer Worker End-to-End API", () => {
       const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(200);
       const data: any = await res.json();
-      // Mock AI answers clef-flash with legacy NER JSON (malformed for clef),
-      // so the request transparently falls back to Llama Guard.
-      expect(data.models).toEqual([
-        "@cf/cloudflare/clef-flash",
-        "@cf/meta/llama-guard-3-8b",
-      ]);
+      expect(data.models).toEqual(["gemini-3.5-flash-lite"]);
     });
 
-    test("POST /detect reports which models ran and accepts clefThreshold", async () => {
+    test("POST /detect reports gemini models and accepts clefThreshold (ignored)", async () => {
       const req = new Request("https://trust.internal/detect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -468,23 +495,17 @@ describe("Trust Layer Worker End-to-End API", () => {
       const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(200);
       const data: any = await res.json();
-      expect(data.models).toEqual([
-        "@cf/cloudflare/clef-flash",
-        "@cf/meta/llama-3.1-8b-instruct-fp8",
-      ]);
+      expect(data.models).toEqual(["gemini-3.5-flash-lite"]);
     });
 
     test("POST /detect with allowDegraded answers degraded instead of 503", async () => {
-      const downEnv = {
-        ...env,
-        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
-      };
+      globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
       const req = new Request("https://trust.internal/detect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: "email jane@example.com", allowDegraded: true }),
       });
-      const res = await authenticatedFetch(req, downEnv, {} as any);
+      const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(200);
       const data: any = await res.json();
       expect(data.degraded).toBe(true);
@@ -492,28 +513,18 @@ describe("Trust Layer Worker End-to-End API", () => {
     });
 
     test("POST /detect without allowDegraded still fails closed with 503", async () => {
-      const downEnv = {
-        ...env,
-        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
-      };
+      globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
       const req = new Request("https://trust.internal/detect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: "email jane@example.com" }),
       });
-      const res = await authenticatedFetch(req, downEnv, {} as any);
+      const res = await authenticatedFetch(req, env, {} as any);
       expect(res.status).toBe(503);
     });
 
-    test("AI outage fails closed on /detect and /moderate unless allowDegraded is set", async () => {
-      const failingEnv = {
-        ...env,
-        AI: {
-          run: async () => {
-            throw Object.assign(new Error("Upstream AI failure"), { status: 503 });
-          },
-        } as any,
-      };
+    test("Gemini outage fails closed on /detect and /moderate unless allowDegraded is set", async () => {
+      globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
       const post = (path: string, body: unknown) =>
         authenticatedFetch(
           new Request(`https://trust.internal${path}`, {
@@ -521,7 +532,7 @@ describe("Trust Layer Worker End-to-End API", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           }),
-          failingEnv,
+          env,
           {} as any
         );
       // Without allowDegraded the outage fails closed on both paths.
@@ -534,7 +545,7 @@ describe("Trust Layer Worker End-to-End API", () => {
       expect(mod.degraded).toBe(true);
       // Health reports the outage.
       const health: any = await (
-        await authenticatedFetch(new Request("https://trust.internal/health"), failingEnv, {} as any)
+        await authenticatedFetch(new Request("https://trust.internal/health"), env, {} as any)
       ).json();
       expect(health.status).toBe("degraded");
       expect(health.ai).toBe("unavailable");
@@ -601,10 +612,7 @@ describe("Trust Layer Worker End-to-End API", () => {
     });
 
     test("degraded detect results are never cached", async () => {
-      const downEnv = {
-        ...env,
-        AI: { run: async () => { throw new Error("503 Service Unavailable"); } } as any,
-      };
+      globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as any;
       const post = () =>
         authenticatedFetch(
           new Request("https://trust.internal/detect", {
@@ -612,7 +620,7 @@ describe("Trust Layer Worker End-to-End API", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text: "email jane@example.com", allowDegraded: true }),
           }),
-          downEnv,
+          env,
           {} as any
         );
       const first: any = await (await post()).json();
@@ -626,68 +634,77 @@ describe("Trust Layer Worker End-to-End API", () => {
       const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
       const res = await entrypoint.detect("hello Alice");
       expect(res.count).toBe(res.spans.length);
-      expect(res.models).toEqual([
-        "@cf/cloudflare/clef-flash",
-        "@cf/meta/llama-3.1-8b-instruct-fp8",
-      ]);
+      expect(res.models).toEqual(["gemini-3.5-flash-lite"]);
     });
 
     test("RPC detect() serves repeats from cache without inference", async () => {
-      let aiCalls = 0;
-      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
-      env.AI.run = (async (model: string, input: any) => {
-        aiCalls++;
-        return inner(model, input);
+      let fetchCalls = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (...args: any[]) => {
+        fetchCalls++;
+        return (realFetch as any)(...args);
       }) as any;
-      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
-      const first = await entrypoint.detect("Cache me Alice");
-      expect(first.cached).toBeUndefined();
-      expect(aiCalls).toBeGreaterThan(0);
-      const before = aiCalls;
-      const second = await entrypoint.detect("Cache me Alice");
-      expect(second.cached).toBe(true);
-      expect(second.models).toEqual([]);
-      expect(aiCalls).toBe(before);
-      expect(second.spans).toEqual(first.spans);
-      expect(second.count).toBe(first.count);
+      try {
+        const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+        const first = await entrypoint.detect("Cache me Alice");
+        expect(first.cached).toBeUndefined();
+        expect(fetchCalls).toBeGreaterThan(0);
+        const before = fetchCalls;
+        const second = await entrypoint.detect("Cache me Alice");
+        expect(second.cached).toBe(true);
+        expect(second.models).toEqual([]);
+        expect(fetchCalls).toBe(before);
+        expect(second.spans).toEqual(first.spans);
+        expect(second.count).toBe(first.count);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     });
 
     test("RPC moderate() serves repeats from cache without inference", async () => {
-      let aiCalls = 0;
-      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
-      env.AI.run = (async (model: string, input: any) => {
-        aiCalls++;
-        return inner(model, input);
+      let fetchCalls = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (...args: any[]) => {
+        fetchCalls++;
+        return (realFetch as any)(...args);
       }) as any;
-      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
-      const first = await entrypoint.moderate("Cache this verdict please");
-      expect(first.cached).toBeUndefined();
-      const before = aiCalls;
-      const second = await entrypoint.moderate("Cache this verdict please");
-      expect(second.cached).toBe(true);
-      expect(second.models).toEqual([]);
-      expect(aiCalls).toBe(before);
-      expect(second.safe).toBe(first.safe);
-      expect(second.action).toBe(first.action);
-      expect(second.findings).toEqual(first.findings);
+      try {
+        const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+        const first = await entrypoint.moderate("Cache this verdict please");
+        expect(first.cached).toBeUndefined();
+        const before = fetchCalls;
+        const second = await entrypoint.moderate("Cache this verdict please");
+        expect(second.cached).toBe(true);
+        expect(second.models).toEqual([]);
+        expect(fetchCalls).toBe(before);
+        expect(second.safe).toBe(first.safe);
+        expect(second.action).toBe(first.action);
+        expect(second.findings).toEqual(first.findings);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     });
 
     test("cache keys isolate different options", async () => {
-      let aiCalls = 0;
-      const inner = env.AI.run.bind(env.AI) as (model: string, input: any) => Promise<any>;
-      env.AI.run = (async (model: string, input: any) => {
-        aiCalls++;
-        return inner(model, input);
+      let fetchCalls = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (...args: any[]) => {
+        fetchCalls++;
+        return (realFetch as any)(...args);
       }) as any;
-      const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
-      await entrypoint.detect("Option isolation Alice");
-      const afterFirst = aiCalls;
-      await entrypoint.detect("Option isolation Alice", { enabledTypes: ["PERSON"] });
-      expect(aiCalls).toBeGreaterThan(afterFirst); // different key: miss, not hit
-      await entrypoint.moderate("Option isolation verdict", { mode: "warn" });
-      const afterWarn = aiCalls;
-      await entrypoint.moderate("Option isolation verdict", { mode: "block" });
-      expect(aiCalls).toBeGreaterThan(afterWarn);
+      try {
+        const entrypoint = new TrustLayerWorkerEntrypoint({} as any, env);
+        await entrypoint.detect("Option isolation Alice");
+        const afterFirst = fetchCalls;
+        await entrypoint.detect("Option isolation Alice", { enabledTypes: ["PERSON"] });
+        expect(fetchCalls).toBeGreaterThan(afterFirst); // different key: miss, not hit
+        await entrypoint.moderate("Option isolation verdict", { mode: "warn" });
+        const afterWarn = fetchCalls;
+        await entrypoint.moderate("Option isolation verdict", { mode: "block" });
+        expect(fetchCalls).toBeGreaterThan(afterWarn);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     });
   });
 });
