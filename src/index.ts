@@ -81,6 +81,7 @@ try {
 export interface MaskApiRequest {
   text: string;
   key?: string;
+  tenantId?: string;
   entities?: PiiType[];
   format?: "numbered" | "uuid" | "custom";
   ttlSeconds?: number;
@@ -112,6 +113,7 @@ export interface UnmaskApiRequest {
   text: string;
   key: string;
   vaultId?: string;
+  tenantId?: string;
 }
 
 export interface UnmaskApiResponse {
@@ -128,11 +130,20 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Encryption-Key",
 };
 
+const SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+  "Referrer-Policy": "no-referrer",
+  "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+};
+
 function json(body: unknown, status = 200): Response {
   return Response.json(body, {
     status,
     headers: {
       ...CORS_HEADERS,
+      ...SECURITY_HEADERS,
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
     },
@@ -227,20 +238,7 @@ async function cachedModerate(
   return result;
 }
 
-/**
- * Fault-injection hook for fallback verification. When the operator sets
- * TRUST_FORCE_AI_FAILURE=1, every inference call fails with a 503 shaped
- * exactly like a real provider outage — proving the degraded path without
- * waiting for an outage. Default off; never set in production.
- */
 function requestAi(env: Env): Env["AI"] {
-  if (env.TRUST_FORCE_AI_FAILURE === "1") {
-    return {
-      run: async () => {
-        throw Object.assign(new Error("injected AI failure (TRUST_FORCE_AI_FAILURE)"), { status: 503 });
-      },
-    } as unknown as Env["AI"];
-  }
   return env.AI;
 }
 
@@ -425,6 +423,7 @@ export async function executeMasking(
   const tokenList: Array<{ token: string; type: PiiType }> = [];
   const detectedTypes = new Set<string>();
 
+  const tenantId = typeof request.tenantId === "string" ? request.tenantId.trim().slice(0, 128) : "";
   for (const [token, meta] of Object.entries(maskResult.tokenMap)) {
     plainRecordMap[token] = meta.value;
     tokenList.push({ token, type: meta.type });
@@ -435,6 +434,7 @@ export async function executeMasking(
     tokenRecords.push({
       tokenId: token,
       vaultId: maskResult.vaultId,
+      tenantId,
       piiType: meta.type,
       iv: encryptedToken.iv,
       encryptedValue: encryptedToken.ciphertext,
@@ -447,6 +447,7 @@ export async function executeMasking(
   const encryptedMap = await encryptRecordMap(plainRecordMap, derived.key);
   const vaultRecord: VaultRecord = {
     vaultId: maskResult.vaultId,
+    tenantId,
     salt: derived.salt || null,
     iv: encryptedMap.iv,
     encryptedData: encryptedMap.encryptedData,
@@ -494,8 +495,9 @@ export async function executeUnmasking(
     await initDatabase(env.DB);
   }
 
+  const tenantId = typeof request.tenantId === "string" ? request.tenantId.trim().slice(0, 128) : "";
   const candidateTokens =
-    request.text.match(/\[(?:PII:)?[A-Z_]+(?:_\d+|:[a-f0-9]+)?\]/g) || [];
+    request.text.match(/\[(?:PII:)?[A-Z_]+(?:_\d+|:[a-f0-9-]+)?\]/g) || [];
 
   if (candidateTokens.length === 0 && !request.vaultId) {
     const elapsed = Math.round((performance.now() - startTime) * 100) / 100;
@@ -512,7 +514,7 @@ export async function executeUnmasking(
 
   // Method A: Vault ID lookup (fastest single-query batch decrypt)
   if (request.vaultId && env.DB) {
-    const vault = await getVaultRecord(env.DB, request.vaultId);
+    const vault = await getVaultRecord(env.DB, request.vaultId, tenantId);
     if (vault) {
       if (vault.expiresAt && vault.expiresAt < Date.now()) {
         throw new Error(
@@ -535,26 +537,28 @@ export async function executeUnmasking(
     }
   }
 
-  // Method B: Token-based lookup for any remaining or standalone tokens
+  // Method B: Token-based lookup scoped strictly by tenantId and each token's own vault
   if (Object.keys(plainMap).length === 0 && candidateTokens.length > 0 && env.DB) {
-    const tokens = await getTokens(env.DB, candidateTokens);
+    const tokens = await getTokens(env.DB, candidateTokens, tenantId);
     if (tokens.length > 0) {
-      // Find vault salt if applicable
-      const firstVaultId = tokens[0].vaultId;
-      const vault = await getVaultRecord(env.DB, firstVaultId);
-      const derived = await deriveKey(request.key, vault?.salt || undefined);
-
+      const saltKeys = new Map<string, CryptoKey>();
       for (const token of tokens) {
         if (token.expiresAt && token.expiresAt < Date.now()) continue;
         try {
+          let key = saltKeys.get(token.vaultId);
+          if (!key) {
+            const vault = await getVaultRecord(env.DB, token.vaultId, tenantId);
+            key = (await deriveKey(request.key, vault?.salt || undefined)).key;
+            saltKeys.set(token.vaultId, key);
+          }
           const decrypted = await decryptPii(
             token.encryptedValue,
             token.iv,
-            derived.key
+            key
           );
           plainMap[token.tokenId] = decrypted;
         } catch {
-          // Skip or throw on failure
+          // Skip on wrong key / mismatched vault
         }
       }
     }
@@ -690,19 +694,15 @@ export const httpHandler = {
         const body = (await request.json().catch(() => ({}))) as {
           text: string;
           mode?: "block" | "warn";
-          heuristicOnly?: boolean;
-          allowedCategories?: string[];
           useClef?: boolean;
           allowDegraded?: boolean;
         };
         if (!body.text || typeof body.text !== "string") {
           return errorResponse("Missing or invalid 'text' field in request body.", 400);
         }
-        if (!env.AI && !body.heuristicOnly) return errorResponse("Workers AI binding unavailable", 503);
+        if (!env.AI) return errorResponse("Workers AI binding unavailable", 503);
         const result = await cachedModerate(env, body.text, {
           mode: body.mode || "block",
-          heuristicOnly: body.heuristicOnly,
-          allowedCategories: body.allowedCategories,
           useClef: body.useClef,
           allowDegraded: body.allowDegraded,
         });

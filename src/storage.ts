@@ -6,6 +6,7 @@ import { CACHE_SCHEMA_STATEMENTS } from "./cache";
 
 export interface VaultRecord {
   vaultId: string;
+  tenantId?: string;
   salt?: string | null;
   iv: string;
   encryptedData: string;
@@ -18,6 +19,7 @@ export interface VaultRecord {
 export interface TokenRecord {
   tokenId: string;
   vaultId: string;
+  tenantId?: string;
   piiType: string;
   iv: string;
   encryptedValue: string;
@@ -28,6 +30,7 @@ export interface TokenRecord {
 export const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS pii_vault (
   vault_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '',
   salt TEXT,
   iv TEXT NOT NULL,
   encrypted_data TEXT NOT NULL,
@@ -39,6 +42,7 @@ export const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS pii_tokens (
   token_id TEXT NOT NULL,
   vault_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT '',
   pii_type TEXT NOT NULL,
   iv TEXT NOT NULL,
   encrypted_value TEXT NOT NULL,
@@ -48,6 +52,7 @@ export const SCHEMA_STATEMENTS = [
 )`,
   `CREATE INDEX IF NOT EXISTS idx_pii_tokens_vault ON pii_tokens(vault_id)`,
   `CREATE INDEX IF NOT EXISTS idx_pii_tokens_token_id ON pii_tokens(token_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_pii_tokens_expires ON pii_tokens(expires_at)`,
   `CREATE INDEX IF NOT EXISTS idx_pii_vault_expires ON pii_vault(expires_at)`,
   ...CACHE_SCHEMA_STATEMENTS,
 ];
@@ -64,6 +69,18 @@ export async function initDatabase(db: D1Database): Promise<void> {
   for (const stmt of SCHEMA_STATEMENTS) {
     await db.prepare(stmt).run();
   }
+  for (const alter of [
+    "ALTER TABLE pii_vault ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pii_tokens ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+  ]) {
+    try {
+      await db.prepare(alter).run();
+    } catch (e: any) {
+      if (!/duplicate column/i.test(String(e?.message ?? e))) throw e;
+    }
+  }
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_tokens_tenant_token ON pii_tokens(tenant_id, token_id)").run();
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_vault_tenant ON pii_vault(tenant_id, vault_id)").run();
   initializedDatabases.add(db);
 }
 
@@ -75,13 +92,23 @@ export async function storeVaultRecord(
   record: VaultRecord,
   tokens: TokenRecord[] = []
 ): Promise<void> {
+  const tenantId = record.tenantId ?? "";
+  const existing = await db
+    .prepare("SELECT tenant_id FROM pii_vault WHERE vault_id = ? LIMIT 1")
+    .bind(record.vaultId)
+    .first<{ tenant_id: string }>();
+  if (existing && (existing.tenant_id ?? "") !== tenantId) {
+    throw Object.assign(new Error("Vault belongs to another tenant."), { status: 403 });
+  }
+
   const vaultStmt = db
     .prepare(
-      `INSERT OR REPLACE INTO pii_vault (vault_id, salt, iv, encrypted_data, pii_types, item_count, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR REPLACE INTO pii_vault (vault_id, tenant_id, salt, iv, encrypted_data, pii_types, item_count, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       record.vaultId,
+      tenantId,
       record.salt ?? null,
       record.iv,
       record.encryptedData,
@@ -94,12 +121,13 @@ export async function storeVaultRecord(
   const tokenStmts = tokens.map((token) =>
     db
       .prepare(
-        `INSERT OR REPLACE INTO pii_tokens (token_id, vault_id, pii_type, iv, encrypted_value, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT OR REPLACE INTO pii_tokens (token_id, vault_id, tenant_id, pii_type, iv, encrypted_value, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         token.tokenId,
         token.vaultId,
+        token.tenantId ?? tenantId,
         token.piiType,
         token.iv,
         token.encryptedValue,
@@ -116,16 +144,18 @@ export async function storeVaultRecord(
  */
 export async function getVaultRecord(
   db: D1Database,
-  vaultId: string
+  vaultId: string,
+  tenantId: string = ""
 ): Promise<VaultRecord | null> {
   const row = await db
     .prepare(
-      `SELECT vault_id, salt, iv, encrypted_data, pii_types, item_count, created_at, expires_at
-       FROM pii_vault WHERE vault_id = ?`
+      `SELECT vault_id, tenant_id, salt, iv, encrypted_data, pii_types, item_count, created_at, expires_at
+       FROM pii_vault WHERE vault_id = ? AND tenant_id = ?`
     )
-    .bind(vaultId)
+    .bind(vaultId, tenantId)
     .first<{
       vault_id: string;
+      tenant_id: string;
       salt: string | null;
       iv: string;
       encrypted_data: string;
@@ -151,6 +181,7 @@ export async function getVaultRecord(
 
   return {
     vaultId: row.vault_id,
+    ...(row.tenant_id ? { tenantId: row.tenant_id } : {}),
     salt: row.salt ?? null,
     iv: row.iv,
     encryptedData: row.encrypted_data,
@@ -162,26 +193,29 @@ export async function getVaultRecord(
 }
 
 /**
- * Retrieves tokens matching the provided token IDs.
+ * Retrieves tokens matching the provided token IDs, scoped by tenantId.
  */
 export async function getTokens(
   db: D1Database,
-  tokenIds: string[]
+  tokenIds: string[],
+  tenantId: string = ""
 ): Promise<TokenRecord[]> {
   if (!tokenIds || tokenIds.length === 0) {
     return [];
   }
 
-  const placeholders = tokenIds.map(() => "?").join(", ");
+  const bounded = [...new Set(tokenIds)].slice(0, 100);
+  const placeholders = bounded.map(() => "?").join(", ");
   const { results } = await db
     .prepare(
-      `SELECT token_id, vault_id, pii_type, iv, encrypted_value, created_at, expires_at
-       FROM pii_tokens WHERE token_id IN (${placeholders})`
+      `SELECT token_id, vault_id, tenant_id, pii_type, iv, encrypted_value, created_at, expires_at
+       FROM pii_tokens WHERE tenant_id = ? AND token_id IN (${placeholders}) LIMIT 200`
     )
-    .bind(...tokenIds)
+    .bind(tenantId, ...bounded)
     .all<{
       token_id: string;
       vault_id: string;
+      tenant_id: string;
       pii_type: string;
       iv: string;
       encrypted_value: string;
@@ -192,6 +226,7 @@ export async function getTokens(
   return (results || []).map((row) => ({
     tokenId: row.token_id,
     vaultId: row.vault_id,
+    tenantId: row.tenant_id ?? "",
     piiType: row.pii_type,
     iv: row.iv,
     encryptedValue: row.encrypted_value,

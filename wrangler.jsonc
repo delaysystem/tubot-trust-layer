@@ -41,7 +41,7 @@
     "enabled": true,
     // Billing: automatic invocation logs + traces bill per persisted event
     // (Oct 2026: ~21M events ≈ $0.72). App console logs still persist.
-    "logs": { "enabled": true, "invocation_logs": false },
+    "logs": { "enabled": true, "invocation_logs": false, "head_sampling_rate": 0.1 },
     "traces": { "enabled": false }
   },
   "upload_source_maps": true,

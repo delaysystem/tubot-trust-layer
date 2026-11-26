@@ -505,8 +505,15 @@ describe("Trust Layer Worker End-to-End API", () => {
       expect(res.status).toBe(503);
     });
 
-    test("TRUST_FORCE_AI_FAILURE injects a 503-shaped outage on every inference path", async () => {
-      const injectedEnv = { ...env, TRUST_FORCE_AI_FAILURE: "1" };
+    test("AI outage fails closed on /detect and /moderate unless allowDegraded is set", async () => {
+      const failingEnv = {
+        ...env,
+        AI: {
+          run: async () => {
+            throw Object.assign(new Error("Upstream AI failure"), { status: 503 });
+          },
+        } as any,
+      };
       const post = (path: string, body: unknown) =>
         authenticatedFetch(
           new Request(`https://trust.internal${path}`, {
@@ -514,10 +521,10 @@ describe("Trust Layer Worker End-to-End API", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           }),
-          injectedEnv,
+          failingEnv,
           {} as any
         );
-      // Without the flag the injected outage fails closed on both paths.
+      // Without allowDegraded the outage fails closed on both paths.
       expect((await post("/detect", { text: "email jane@example.com" })).status).toBe(503);
       expect((await post("/moderate", { text: "hello world" })).status).toBe(503);
       // With allowDegraded both paths answer degraded.
@@ -525,9 +532,9 @@ describe("Trust Layer Worker End-to-End API", () => {
       expect(det.degraded).toBe(true);
       const mod: any = await (await post("/moderate", { text: "hello world", allowDegraded: true })).json();
       expect(mod.degraded).toBe(true);
-      // Health reports the injected outage.
+      // Health reports the outage.
       const health: any = await (
-        await authenticatedFetch(new Request("https://trust.internal/health"), injectedEnv, {} as any)
+        await authenticatedFetch(new Request("https://trust.internal/health"), failingEnv, {} as any)
       ).json();
       expect(health.status).toBe("degraded");
       expect(health.ai).toBe("unavailable");

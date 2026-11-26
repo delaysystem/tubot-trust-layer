@@ -19,15 +19,27 @@ type Exports = { memory: WebAssembly.Memory; pii_alloc(n: number): number;
   pii_free(p: number, n: number): void; pii_scan(p: number, n: number): number;
   pii_free_result(p: number): void };
 
+let sharedWasm: Exports | null = null;
+
+function getWasmInstance(): Exports {
+  if (!sharedWasm) {
+    sharedWasm = new WebAssembly.Instance(module, {}).exports as unknown as Exports;
+  }
+  return sharedWasm;
+}
+
 export function wasmScan(text: string, enabledTypes?: PiiType[]): DetectedSpan[] {
   if (!text) return [];
   const input = new TextEncoder().encode(text);
   if (input.length > 65536) throw Object.assign(new Error("PII input exceeds 64 KiB"), { status: 413 });
-  // Each request owns its instance; no tenant text or memory survives in a shared instance.
-  const instance = new WebAssembly.Instance(module, {});
-  const wasm = instance.exports as unknown as Exports;
+  // Reuse the module-level WASM instance per isolate; Rust volatile-zeros
+  // both input (pii_free) and result (pii_free_result) buffers in finally.
+  const wasm = getWasmInstance();
   const ptr = wasm.pii_alloc(input.length);
-  if (!ptr) throw new Error("PII allocation failed");
+  if (!ptr) {
+    sharedWasm = null;
+    throw new Error("PII allocation failed");
+  }
   let output = 0;
   try {
     new Uint8Array(wasm.memory.buffer, ptr, input.length).set(input);
@@ -42,14 +54,12 @@ export function wasmScan(text: string, enabledTypes?: PiiType[]): DetectedSpan[]
       if (!Number.isInteger(d.start) || !Number.isInteger(d.end) || d.start < 0 || d.end > text.length || d.end <= d.start) throw new Error("Invalid PII span");
       return { ...d, text: text.slice(d.start, d.end), source: "wasm" };
     });
+  } catch (err) {
+    sharedWasm = null;
+    throw err;
   } finally {
     input.fill(0);
     if (output) wasm.pii_free_result(output);
     wasm.pii_free(ptr, input.length);
-    // No full-memory wipe (was O(memory) per request): this instance is
-    // request-local and discarded after the scan, so nothing can observe its
-    // heap afterwards; the Rust side already volatile-wipes the input
-    // (pii_free) and result (pii_free_result) buffers, the only tenant bytes
-    // addressable through the exports. Origin: COST-17.
   }
 }

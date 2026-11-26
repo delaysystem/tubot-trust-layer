@@ -18,23 +18,29 @@ function mapType(type: string): PiiType | undefined {
   return undefined;
 }
 
+const WANTED_PATTERNS = [
+  ...new Set(
+    new LiteOpenRedaction({ includeNames: false })
+      .getPatterns()
+      .filter((p) => mapType(p.type))
+      .map((p) => p.type),
+  ),
+];
+
+const SHARED_REDACTOR = new LiteOpenRedaction({
+  patterns: WANTED_PATTERNS,
+  includeNames: false,
+  enableContextAnalysis: true,
+  enableCache: false,
+  enableAuditLog: false,
+  enableMetrics: false,
+  debug: false,
+});
+
 export async function openRedactionScan(text: string, enabledTypes?: PiiType[]): Promise<DetectedSpan[]> {
-  // Request-local instance. Disable caches, logging, metrics and learned tenant state.
-  const patterns = new LiteOpenRedaction({ includeNames: false }).getPatterns();
-  const wanted = [...new Set(patterns.filter((p) => mapType(p.type)).map((p) => p.type))];
-  // No requested type maps to a Lite pattern (e.g. semantic-only filters):
-  // every detection would be dropped by the post-filter below, so skip the
-  // redactor build + detect passes entirely. Partial overlaps keep the full
-  // pattern set: context analysis could couple patterns, so narrowing it is
-  // not provably output-identical. Origin: COST-01.
-  if (enabledTypes && !wanted.some((t) => enabledTypes.includes(mapType(t)!))) return [];
-  const redactor = new LiteOpenRedaction({
-    patterns: wanted,
-    includeNames: false, enableContextAnalysis: true, enableCache: false,
-    enableAuditLog: false, enableMetrics: false, debug: false,
-  });
+  if (enabledTypes && !WANTED_PATTERNS.some((t) => enabledTypes.includes(mapType(t)!))) return [];
   try {
-    const result = await redactor.detect(text);
+    const result = await SHARED_REDACTOR.detect(text);
     return result.detections.flatMap((d) => {
       const type = mapType(d.type);
       if (!type || (enabledTypes && !enabledTypes.includes(type))) return [];
