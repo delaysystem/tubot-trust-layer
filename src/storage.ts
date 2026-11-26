@@ -60,28 +60,49 @@ export const SCHEMA_STATEMENTS = [
 export const SCHEMA_SQL = SCHEMA_STATEMENTS.join(";\n") + ";";
 
 const initializedDatabases = new WeakSet<D1Database>();
+const initializingDatabases = new WeakMap<D1Database, Promise<void>>();
 
 /**
  * Initializes the database tables and indexes if they do not exist.
+ * Coalesces concurrent cold-start callers onto one in-flight Promise and batches DDL.
  */
 export async function initDatabase(db: D1Database): Promise<void> {
   if (initializedDatabases.has(db)) return;
-  for (const stmt of SCHEMA_STATEMENTS) {
-    await db.prepare(stmt).run();
-  }
-  for (const alter of [
-    "ALTER TABLE pii_vault ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE pii_tokens ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-  ]) {
-    try {
-      await db.prepare(alter).run();
-    } catch (e: any) {
-      if (!/duplicate column/i.test(String(e?.message ?? e))) throw e;
+  const inflight = initializingDatabases.get(db);
+  if (inflight) return inflight;
+  const work = (async () => {
+    if (typeof db.batch === "function") {
+      await db.batch(SCHEMA_STATEMENTS.map((stmt) => db.prepare(stmt)));
+    } else {
+      for (const stmt of SCHEMA_STATEMENTS) {
+        await db.prepare(stmt).run();
+      }
     }
-  }
-  await db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_tokens_tenant_token ON pii_tokens(tenant_id, token_id)").run();
-  await db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_vault_tenant ON pii_vault(tenant_id, vault_id)").run();
-  initializedDatabases.add(db);
+    for (const alter of [
+      "ALTER TABLE pii_vault ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pii_tokens ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+    ]) {
+      try {
+        await db.prepare(alter).run();
+      } catch (e: any) {
+        if (!/duplicate column/i.test(String(e?.message ?? e))) throw e;
+      }
+    }
+    const idxStmts = [
+      db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_tokens_tenant_token ON pii_tokens(tenant_id, token_id)"),
+      db.prepare("CREATE INDEX IF NOT EXISTS idx_pii_vault_tenant ON pii_vault(tenant_id, vault_id)"),
+    ];
+    if (typeof db.batch === "function") {
+      await db.batch(idxStmts);
+    } else {
+      for (const s of idxStmts) await s.run();
+    }
+    initializedDatabases.add(db);
+  })().finally(() => {
+    initializingDatabases.delete(db);
+  });
+  initializingDatabases.set(db, work);
+  return work;
 }
 
 /**
@@ -297,16 +318,17 @@ export async function pruneExpiredRecords(
   db: D1Database,
   now: number = Date.now()
 ): Promise<number> {
+  const PRUNE_BATCH_LIMIT = 500;
   const pruneTokensStmt = db
     .prepare(
-      `DELETE FROM pii_tokens WHERE expires_at IS NOT NULL AND expires_at < ?`
+      `DELETE FROM pii_tokens WHERE rowid IN (SELECT rowid FROM pii_tokens WHERE expires_at IS NOT NULL AND expires_at < ? LIMIT ?)`
     )
-    .bind(now);
+    .bind(now, PRUNE_BATCH_LIMIT);
   const pruneVaultStmt = db
     .prepare(
-      `DELETE FROM pii_vault WHERE expires_at IS NOT NULL AND expires_at < ?`
+      `DELETE FROM pii_vault WHERE rowid IN (SELECT rowid FROM pii_vault WHERE expires_at IS NOT NULL AND expires_at < ? LIMIT ?)`
     )
-    .bind(now);
+    .bind(now, PRUNE_BATCH_LIMIT);
 
   const results = await db.batch([pruneTokensStmt, pruneVaultStmt]);
   const tokensPruned = results[0]?.meta?.changes ?? 0;

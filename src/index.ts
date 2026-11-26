@@ -160,6 +160,34 @@ function errorResponse(message: string, status = 400): Response {
  * direct call, while detection errors (413/503) still propagate. Degraded
  * (local-only) results are never cached: only full-fidelity entries are stored.
  */
+const L1_CACHE_TTL_MS = 5 * 60 * 1000;
+const L1_CACHE_MAX_ENTRIES = 512;
+const l1CacheByDb = new WeakMap<D1Database, Map<string, { value: string; expiresAt: number }>>();
+
+function l1CacheGet(db: D1Database, key: string): string | null {
+  const map = l1CacheByDb.get(db);
+  const hit = map?.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    map!.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function l1CacheSet(db: D1Database, key: string, value: string): void {
+  let map = l1CacheByDb.get(db);
+  if (!map) {
+    map = new Map();
+    l1CacheByDb.set(db, map);
+  }
+  if (!map.has(key) && map.size >= L1_CACHE_MAX_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, { value, expiresAt: Date.now() + L1_CACHE_TTL_MS });
+}
+
 async function cachedDetect(
   env: Env,
   text: string,
@@ -173,12 +201,22 @@ async function cachedDetect(
   if (!env.DB) return direct();
   let key: string;
   try {
-    await initDatabase(env.DB);
     key = await detectCacheKey(text, options);
+    const l1Hit = l1CacheGet(env.DB, key);
+    if (l1Hit) {
+      try {
+        const spans = rehydrateSpans(text, JSON.parse(l1Hit).spans);
+        return { spans, count: spans.length, models: [], cached: true };
+      } catch {
+        l1CacheByDb.get(env.DB)?.delete(key);
+      }
+    }
+    await initDatabase(env.DB);
     const hit = await cacheGet(env.DB, key);
     if (hit) {
       try {
         const spans = rehydrateSpans(text, JSON.parse(hit).spans);
+        l1CacheSet(env.DB, key, hit);
         return { spans, count: spans.length, models: [], cached: true };
       } catch {
         await cacheDelete(env.DB, key).catch(() => null);
@@ -189,7 +227,9 @@ async function cachedDetect(
   }
   const result = await direct();
   if (!result.degraded) {
-    await cachePut(env.DB, key!, JSON.stringify({ spans: stripSpanText(result.spans) })).catch(() => null);
+    const serialized = JSON.stringify({ spans: stripSpanText(result.spans) });
+    l1CacheSet(env.DB, key!, serialized);
+    await cachePut(env.DB, key!, serialized).catch(() => null);
   }
   return result;
 }
@@ -208,8 +248,24 @@ async function cachedModerate(
   const started = performance.now();
   let key: string;
   try {
-    await initDatabase(env.DB);
     key = await moderateCacheKey(text, options);
+    const l1Hit = l1CacheGet(env.DB, key);
+    if (l1Hit) {
+      try {
+        const verdict = JSON.parse(l1Hit) as CachedVerdict;
+        if (verdict && typeof verdict === "object" && typeof verdict.safe === "boolean" && Array.isArray(verdict.findings)) {
+          return {
+            ...verdict,
+            executionTimeMs: Math.max(0, Math.round((performance.now() - started) * 100) / 100),
+            models: [],
+            cached: true,
+          };
+        }
+      } catch {
+        l1CacheByDb.get(env.DB)?.delete(key);
+      }
+    }
+    await initDatabase(env.DB);
     const hit = await cacheGet(env.DB, key);
     if (hit) {
       const verdict = JSON.parse(hit) as CachedVerdict;
@@ -219,6 +275,7 @@ async function cachedModerate(
         typeof verdict.safe === "boolean" &&
         Array.isArray(verdict.findings)
       ) {
+        l1CacheSet(env.DB, key, hit);
         return {
           ...verdict,
           executionTimeMs: Math.max(0, Math.round((performance.now() - started) * 100) / 100),
@@ -233,7 +290,9 @@ async function cachedModerate(
   }
   const result = await direct();
   if (!result.degraded) {
-    await cachePut(env.DB, key!, JSON.stringify(stripVerdict(result))).catch(() => null);
+    const serialized = JSON.stringify(stripVerdict(result));
+    l1CacheSet(env.DB, key!, serialized);
+    await cachePut(env.DB, key!, serialized).catch(() => null);
   }
   return result;
 }
@@ -338,27 +397,34 @@ export async function executeMasking(
     await initDatabase(env.DB);
   }
 
-  // 0. Input Moderation & Exploit Shield (Tier 1 Heuristics + Tier 2 Llama Guard 3)
+  // 0 & 1. Run Input Moderation and PII Detection in parallel to halve latency;
+  // if moderation blocks, discard detection and reject immediately with 422.
   let moderationResult: ModerateResult | undefined;
+  const detectOpts: DetectOptions = {
+    enabledTypes: request.entities,
+    useLlama: request.useLlama,
+    useGranite: request.regexOnly ? false : request.useGranite !== false,
+    regexOnly: request.regexOnly,
+    useClef: request.useClef,
+    allowDegraded: request.allowDegraded,
+  };
+  let spans: DetectedSpan[];
   if (request.moderate !== false) {
     if (!env.AI) throw Object.assign(new Error("Workers AI binding unavailable"), { status: 503 });
-    // Legitimate inputs sent to a PII masking service naturally contain personal details (names, emails, phones).
-    // Meta Llama Guard 3 flags personal details as S7 (Privacy Violations).
-    // During PII masking, S7 is permitted by default so that data can be encrypted and protected,
-    // while strictly enforcing cyberattacks (S13), prompt injections & system manipulation (S14),
-    // violent crimes (S1), indiscriminate weapons (S9), hate speech (S10), etc.
     const allowedCategories = request.allowedCategories ?? [
       "S7",
       "Privacy Violations",
     ];
-
-    moderationResult = await cachedModerate(env, moderationText, {
-      mode: request.moderationMode || "block",
-      allowedCategories,
-      useClef: request.useClef,
-      allowDegraded: request.allowDegraded,
-    });
-
+    const [modRes, detectRes] = await Promise.all([
+      cachedModerate(env, moderationText, {
+        mode: request.moderationMode || "block",
+        allowedCategories,
+        useClef: request.useClef,
+        allowDegraded: request.allowDegraded,
+      }),
+      cachedDetect(env, request.text, detectOpts).catch((err) => ({ __detectError: err as Error })),
+    ]);
+    moderationResult = modRes;
     if (moderationResult.action === "block") {
       const categoryList = moderationResult.categories.join(", ") || "Hazard Detected";
       const error: any = new Error(
@@ -368,19 +434,11 @@ export async function executeMasking(
       error.moderation = moderationResult;
       throw error;
     }
+    if ("__detectError" in detectRes) throw detectRes.__detectError;
+    spans = detectRes.spans;
+  } else {
+    spans = (await cachedDetect(env, request.text, detectOpts)).spans;
   }
-
-  // 1. Detect PII using Llama + Rust/Wasm + OpenRedaction + Regex
-  const spans = (
-    await cachedDetect(env, request.text, {
-      enabledTypes: request.entities,
-      useLlama: request.useLlama,
-      useGranite: request.regexOnly ? false : request.useGranite !== false,
-      regexOnly: request.regexOnly,
-      useClef: request.useClef,
-      allowDegraded: request.allowDegraded,
-    })
-  ).spans;
 
   // If no PII detected, return original text
   if (spans.length === 0) {
