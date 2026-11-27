@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "tubot-trust-layer",
+  "account_id": "3b27bbae23636a0e40eff144e12d7317",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-21",
   "workers_dev": false,
@@ -33,7 +34,7 @@
     {
       "binding": "DB",
       "database_name": "agent-dashboard-db-staging",
-      "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
+      "database_id": "572e8088-0bf1-415d-b907-a9fbc62b63ed"
     }
   ],
   "observability": {
